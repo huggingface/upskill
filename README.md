@@ -78,12 +78,10 @@ Evaluating on sonnet... (attempt 1)
 
   SKILL.md              ~450 tokens
 
-┏━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━┓
-┃         ┃ baseline ┃ with skill ┃      ┃
-┡━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━┩
-│ success │ 60%      │ 100%       │ +40% │
-│ tokens  │ 1200     │ 800        │ -33% │
-└─────────┴──────────┴────────────┴──────┘
+  baseline   ████████████░░░░░░░░   60%
+  with skill ████████████████████  100%  (+40%)
+
+  tokens: 1200 → 800  (-33%)
 
 Saved to ./skills/git-commit-messages
 ```
@@ -189,6 +187,61 @@ upskill runs -d ./my-runs/
 
 # Custom output path
 upskill runs --csv ./results.csv
+```
+
+### `upskill plot`
+
+Plot model performance comparing baseline vs with-skill results.
+
+```bash
+upskill plot [OPTIONS]
+```
+
+**Options:**
+- `-d, --dir PATH` - Runs directory
+- `-s, --skill TEXT` - Filter by skill name(s) (can be repeated)
+- `-m, --model TEXT` - Filter by model(s) (can be repeated)
+- `--metric [success|tokens]` - Metric to plot (default: success)
+
+**Examples:**
+
+```bash
+# Plot all eval results
+upskill plot
+
+# Plot from custom runs directory
+upskill plot -d ./my-runs/
+
+# Filter by skill and models
+upskill plot -s my-skill -m haiku -m sonnet
+
+# Plot token usage instead of success rate
+upskill plot --metric tokens
+```
+
+**Output:**
+
+Single skill, multiple models:
+```
+skill: git-commit-messages
+
+haiku
+  baseline   ████████████░░░░░░░░   60%
+  with skill ████████████████████  100%  (+40%)
+
+sonnet
+  baseline   ████████████████░░░░   80%
+  with skill ██████████████████░░   90%  (+10%)
+```
+
+Multiple skills, multiple models (matrix view):
+```
+┏━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━┓
+┃ skill              ┃ haiku       ┃ sonnet      ┃
+┡━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━┩
+│ git-commits        │ 60%→100%    │ 80%→90%     │
+│ json-parser        │ 70%→100%    │ 90%→95%     │
+└────────────────────┴─────────────┴─────────────┘
 ```
 
 ## Skill Output Format
