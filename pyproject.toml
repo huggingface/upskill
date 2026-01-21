@@ -1,12 +1,11 @@
 [project]
 name = "upskill"
-version = "0.1.0"
+version = "0.2.0"
 description = "Generate and evaluate agent skills"
-requires-python = ">=3.11"
+requires-python = ">=3.13.5,<3.14"
 dependencies = [
     "click>=8.1",
-    "anthropic>=0.40",
-    "openai>=1.0",
+    "fast-agent-mcp>=0.4.37",
     "pydantic>=2.0",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
@@ -32,7 +31,7 @@ packages = ["src/upskill"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]

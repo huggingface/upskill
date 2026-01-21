@@ -1,0 +1,46 @@
+# FastAgent Configuration for upskill
+# This configures the agent harness for skill generation and evaluation
+
+# Default Model Configuration:
+# Format: <provider>.<model_string>.<reasoning_effort?>
+# Examples: anthropic.claude-sonnet-4-20250514, openai.gpt-4.1
+# Aliases: haiku, sonnet, opus (Anthropic), gpt-4.1, o3-mini (OpenAI)
+# Local models: generic.<model_name> (e.g., generic.llama3.2:latest)
+default_model: sonnet
+
+# Generic provider for local OpenAI-compatible endpoints (Ollama, llama.cpp, etc.)
+# Override with GENERIC_BASE_URL and GENERIC_API_KEY environment variables
+generic:
+  api_key: "local"
+  base_url: "http://localhost:11434/v1"
+
+# MCP timeline display settings
+mcp_timeline:
+  steps: 20
+  step_seconds: 15
+
+# Shell execution settings
+shell_execution:
+  show_bash: false
+
+# Logging and Console Configuration
+logger:
+  progress_display: true
+  show_chat: false
+  show_tools: false
+  truncate_tools: true
+  streaming: markdown
+
+# MCP Servers (optional - can be enabled for skill testing)
+mcp:
+  servers:
+    fetch:
+      command: "uvx"
+      args: ["mcp-server-fetch"]
+    filesystem:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    huggingface:
+      url: "https://huggingface.co/mcp?bouquet=skills"
+      headers:
+        "Authorization": "Bearer ${HF_TOKEN}"

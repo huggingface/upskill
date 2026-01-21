@@ -13,19 +13,49 @@ def get_config_dir() -> Path:
     return Path.home() / ".config" / "upskill"
 
 
-def get_skills_dir() -> Path:
-    """Get the default skills directory."""
-    return get_config_dir() / "skills"
+def get_default_skills_dir() -> Path:
+    """Get the default skills directory (current working directory)."""
+    return Path.cwd() / "skills"
+
+
+def get_default_runs_dir() -> Path:
+    """Get the default runs directory for logging."""
+    return Path.cwd() / "runs"
+
+
+def find_config_path() -> Path:
+    """Find the fastagent config file, checking cwd first then package root."""
+    cwd_config = Path.cwd() / "fastagent.config.yaml"
+    if cwd_config.exists():
+        return cwd_config
+    # Fall back to package-bundled config
+    package_config = Path(__file__).parent.parent.parent / "fastagent.config.yaml"
+    if package_config.exists():
+        return package_config
+    return cwd_config  # Return cwd path even if not exists (FastAgent will use defaults)
 
 
 class Config(BaseModel):
     """upskill configuration."""
 
-    model: str = Field(default="claude-sonnet-4-20250514", description="Model for generation")
+    # Model settings
+    model: str = Field(default="sonnet", description="Model for generation (FastAgent format)")
     eval_model: str | None = Field(default=None, description="Model for eval (defaults to model)")
-    skills_dir: Path = Field(default_factory=get_skills_dir)
+
+    # Directory settings
+    skills_dir: Path = Field(
+        default_factory=get_default_skills_dir, description="Where to save generated skills"
+    )
+    runs_dir: Path = Field(
+        default_factory=get_default_runs_dir, description="Where to save run logs"
+    )
+
+    # Generation settings
     auto_eval: bool = Field(default=True, description="Run eval after generation")
     max_refine_attempts: int = Field(default=3, description="Max refinement iterations")
+
+    # FastAgent settings
+    fastagent_config: Path | None = Field(default=None, description="Path to fastagent.config.yaml")
 
     @classmethod
     def load(cls) -> Config:
@@ -34,6 +64,13 @@ class Config(BaseModel):
         if config_path.exists():
             with open(config_path) as f:
                 data = yaml.safe_load(f) or {}
+            # Convert path strings to Path objects
+            if "skills_dir" in data and isinstance(data["skills_dir"], str):
+                data["skills_dir"] = Path(data["skills_dir"])
+            if "runs_dir" in data and isinstance(data["runs_dir"], str):
+                data["runs_dir"] = Path(data["runs_dir"])
+            if "fastagent_config" in data and isinstance(data["fastagent_config"], str):
+                data["fastagent_config"] = Path(data["fastagent_config"])
             return cls(**data)
         return cls()
 
@@ -42,10 +79,23 @@ class Config(BaseModel):
         config_dir = get_config_dir()
         config_dir.mkdir(parents=True, exist_ok=True)
         config_path = config_dir / "config.yaml"
+        data = self.model_dump(mode="json")
+        # Convert Path objects to strings for YAML
+        data["skills_dir"] = str(self.skills_dir)
+        data["runs_dir"] = str(self.runs_dir)
+        if self.fastagent_config:
+            data["fastagent_config"] = str(self.fastagent_config)
         with open(config_path, "w") as f:
-            yaml.dump(self.model_dump(mode="json"), f, default_flow_style=False)
+            yaml.dump(data, f, default_flow_style=False)
 
     @property
     def effective_eval_model(self) -> str:
         """Get the model to use for evaluation."""
         return self.eval_model or self.model
+
+    @property
+    def effective_fastagent_config(self) -> Path:
+        """Get the fastagent config path to use."""
+        if self.fastagent_config and self.fastagent_config.exists():
+            return self.fastagent_config
+        return find_config_path()
