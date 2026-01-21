@@ -22,12 +22,28 @@ class SkillMetadata(BaseModel):
     compatibility: str | None = None
 
 
+class ValidationResult(BaseModel):
+    """Structured result from validation with metrics."""
+
+    passed: bool
+    assertions_passed: int
+    assertions_total: int
+    metrics_count: int = 0
+    benchmarks_found: list[str] = Field(default_factory=list)
+    error_message: str | None = None
+
+
 class TestCase(BaseModel):
     """A test case for skill evaluation."""
 
     input: str  # Task/prompt to give the agent
     context: dict | None = None  # Files, env vars, etc.
     expected: dict | None = None  # Expected output checks
+
+    # Custom validator support
+    output_file: str | None = None  # File to validate instead of agent output
+    validator: str | None = None  # Validator name (e.g., "hf_eval_yaml")
+    validator_config: dict | None = None  # Config passed to validator
 
 
 class Skill(BaseModel):
@@ -257,6 +273,9 @@ class TestResult(BaseModel):
     error: str | None = None
     stats: ConversationStats = Field(default_factory=ConversationStats)
 
+    # Detailed validation results (for custom validators)
+    validation_result: ValidationResult | None = None
+
 
 class EvalResults(BaseModel):
     """Results comparing skill vs baseline performance."""
@@ -319,6 +338,10 @@ class RunResult(BaseModel):
     error_message: str | None = None
     session_id: str | None = None
     session_history_file: str | None = None
+
+    # For plot command: distinguish baseline vs with-skill runs
+    run_type: str = "with_skill"  # "with_skill" | "baseline"
+    skill_name: str | None = None  # Name of the skill being evaluated
 
 
 class BatchSummary(BaseModel):

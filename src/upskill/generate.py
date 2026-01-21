@@ -210,6 +210,7 @@ def build_skill_generator(config_path: Path, model: str | None = None) -> FastAg
     fast = FastAgent(
         "upskill-generator",
         ignore_unknown_args=True,
+        parse_cli_args=False,  # Disable CLI arg parsing to avoid conflicts with upskill CLI
         config_path=str(config_path),
     )
 
@@ -233,6 +234,7 @@ def build_test_generator(config_path: Path, model: str | None = None) -> FastAge
     fast = FastAgent(
         "upskill-test-generator",
         ignore_unknown_args=True,
+        parse_cli_args=False,  # Disable CLI arg parsing to avoid conflicts with upskill CLI
         config_path=str(config_path),
     )
 
@@ -372,5 +374,88 @@ Output improved skill as JSON (same structure, no code blocks)."""
             generated_by=model,
             generated_at=datetime.now(UTC),
             source_task=skill.metadata.source_task,
+        ),
+    )
+
+
+IMPROVE_PROMPT = """You are improving an existing skill document for AI agents.
+
+Given the current skill and improvement instructions, create an enhanced version.
+
+## Current Skill
+
+Name: {name}
+Description: {description}
+
+Body:
+{body}
+
+## Improvement Instructions
+
+{instructions}
+
+## Guidelines
+
+1. Preserve what works well in the original skill
+2. Address the specific improvement requests
+3. Maintain the same general structure and format
+4. Add new examples or sections as needed
+5. Keep the skill focused and actionable
+
+Output the improved skill as JSON with this structure:
+{{
+  "name": "skill-name",
+  "description": "Brief description of what this skill teaches.",
+  "body": "The full skill document in markdown format..."
+}}
+
+Output ONLY the JSON, no code blocks or explanations."""
+
+
+async def improve_skill(
+    skill: Skill,
+    instructions: str,
+    model: str | None = None,
+    config: Config | None = None,
+) -> Skill:
+    """Improve an existing skill based on instructions.
+
+    Args:
+        skill: The existing skill to improve
+        instructions: What improvements to make
+        model: Model to use for generation
+        config: Configuration
+
+    Returns:
+        Improved Skill object
+    """
+    config = config or Config.load()
+    model = model or config.model
+    config_path = config.effective_fastagent_config
+
+    prompt = IMPROVE_PROMPT.format(
+        name=skill.name,
+        description=skill.description,
+        body=skill.body,
+        instructions=instructions,
+    )
+
+    fast = build_skill_generator(config_path, model)
+
+    async with fast.run() as agent:
+        response = await agent.skill_gen.send(prompt)
+
+    data = parse_json_response(response)
+
+    return Skill(
+        name=data.get("name", skill.name),
+        description=data.get("description", skill.description),
+        body=data["body"],
+        references=data.get("references", skill.references),
+        scripts=data.get("scripts", skill.scripts),
+        metadata=SkillMetadata(
+            generated_by=model,
+            generated_at=datetime.now(UTC),
+            source_task=f"Improved from {skill.name}: {instructions}",
         ),
     )

@@ -14,7 +14,7 @@ from rich.table import Table
 
 from upskill.config import Config
 from upskill.evaluate import evaluate_skill, get_failure_descriptions
-from upskill.generate import generate_skill, generate_tests, refine_skill
+from upskill.generate import generate_skill, generate_tests, improve_skill, refine_skill
 from upskill.logging import (
     create_batch_folder,
     create_run_folder,
@@ -30,6 +30,7 @@ from upskill.models import (
     RunResult,
     Skill,
     TestCase,
+    TestResult,
 )
 
 load_dotenv()
@@ -48,6 +49,13 @@ def main():
 @click.option("-e", "--example", multiple=True, help="Input -> output example")
 @click.option("--tool", help="Generate from MCP tool schema (path#tool_name)")
 @click.option("--trace", type=click.Path(exists=True), help="Generate from agent trace")
+@click.option(
+    "-f",
+    "--from",
+    "from_skill",
+    type=click.Path(exists=True),
+    help="Existing skill to improve (path to skill directory)",
+)
 @click.option(
     "-m",
     "--model",
@@ -71,6 +79,7 @@ def generate(
     example: tuple[str, ...],
     tool: str | None,  # noqa: ARG001
     trace: str | None,  # noqa: ARG001
+    from_skill: str | None,
     model: str | None,
     output: str | None,
     no_eval: bool,
@@ -80,7 +89,7 @@ def generate(
     runs_dir: str | None,
     log_runs: bool,
 ):
-    """Generate a skill from a task description.
+    """Generate a skill from a task description, or improve an existing skill.
 
     Examples:
 
@@ -92,15 +101,16 @@ def generate(
 
         upskill generate "validate forms" -o ./my-skills/validation
 
+        # Improve an existing skill:
+
+        upskill generate "add more error handling examples" --from ./skills/api-errors/
+
+        upskill generate "make it more concise" -f ./skills/my-skill/ -o ./skills/my-skill-v2/
+
         # Evaluate on a local model (Ollama):
 
         upskill generate "parse YAML" --eval-model llama3.2:latest \\
             --eval-base-url http://localhost:11434/v1
-
-        # Evaluate on a local model (llama.cpp server):
-
-        upskill generate "parse YAML" --eval-model my-model \\
-            --eval-base-url http://localhost:8080/v1
 
         upskill generate "document code" --no-log-runs
     """
@@ -108,6 +118,7 @@ def generate(
         _generate_async(
             task,
             list(example) if example else None,
+            from_skill,
             model,
             output,
             no_eval,
@@ -123,6 +134,7 @@ def generate(
 async def _generate_async(
     task: str,
     examples: list[str] | None,
+    from_skill: str | None,
     model: str | None,
     output: str | None,
     no_eval: bool,
@@ -146,8 +158,14 @@ async def _generate_async(
         batch_id, batch_folder = create_batch_folder(runs_path)
         console.print(f"Logging runs to: {batch_folder}", style="dim")
 
-    console.print(f"Generating skill with {gen_model}...", style="dim")
-    skill = await generate_skill(task=task, examples=examples, model=model, config=config)
+    # Either improve existing skill or generate new one
+    if from_skill:
+        existing_skill = Skill.load(Path(from_skill))
+        console.print(f"Improving [bold]{existing_skill.name}[/bold] with {gen_model}...", style="dim")
+        skill = await improve_skill(existing_skill, instructions=task, model=model, config=config)
+    else:
+        console.print(f"Generating skill with {gen_model}...", style="dim")
+        skill = await generate_skill(task=task, examples=examples, model=model, config=config)
 
     if no_eval:
         _save_and_display(skill, output, config)
@@ -162,41 +180,68 @@ async def _generate_async(
     for attempt in range(config.max_refine_attempts):
         console.print(f"Evaluating on {gen_model}... (attempt {attempt + 1})", style="dim")
 
-        # Create run folder for logging
+        # Create run folder for logging (2 folders per attempt: baseline + with_skill)
         run_folder = None
         if log_runs and batch_folder:
-            run_folder = create_run_folder(batch_folder, attempt + 1)
+            baseline_run_num = attempt * 2 + 1
+            run_folder = create_run_folder(batch_folder, baseline_run_num)
             write_run_metadata(
                 run_folder,
                 RunMetadata(
                     model=gen_model,
                     task=task,
                     batch_id=batch_id or "",
-                    run_number=attempt + 1,
+                    run_number=baseline_run_num,
                 ),
             )
 
         results = await evaluate_skill(skill, test_cases, model=gen_model, config=config)
 
-        # Log run result
+        # Log run results (both baseline and with-skill for plot command)
         if log_runs and run_folder:
-            run_result = RunResult(
+            # Log baseline result
+            baseline_result = RunResult(
                 metadata=RunMetadata(
                     model=gen_model,
                     task=task,
                     batch_id=batch_id or "",
-                    run_number=attempt + 1,
+                    run_number=baseline_run_num,
                 ),
                 stats=ConversationStats(
-                    tokens=results.with_skill_total_tokens,
+                    total_tokens=results.baseline_total_tokens,
+                    turns=int(results.baseline_avg_turns * len(test_cases)),
+                ),
+                passed=results.baseline_success_rate > 0.5,
+                assertions_passed=int(results.baseline_success_rate * len(test_cases)),
+                assertions_total=len(test_cases),
+                run_type="baseline",
+                skill_name=skill.name,
+            )
+            write_run_result(run_folder, baseline_result)
+            run_results.append(baseline_result)
+
+            # Log with-skill result (in a separate folder)
+            with_skill_folder = create_run_folder(batch_folder, attempt * 2 + 2)
+            with_skill_result = RunResult(
+                metadata=RunMetadata(
+                    model=gen_model,
+                    task=task,
+                    batch_id=batch_id or "",
+                    run_number=attempt * 2 + 2,
+                ),
+                stats=ConversationStats(
+                    total_tokens=results.with_skill_total_tokens,
                     turns=int(results.with_skill_avg_turns * len(test_cases)),
                 ),
                 passed=results.is_beneficial,
                 assertions_passed=int(results.with_skill_success_rate * len(test_cases)),
                 assertions_total=len(test_cases),
+                run_type="with_skill",
+                skill_name=skill.name,
             )
-            write_run_result(run_folder, run_result)
-            run_results.append(run_result)
+            write_run_metadata(with_skill_folder, with_skill_result.metadata)
+            write_run_result(with_skill_folder, with_skill_result)
+            run_results.append(with_skill_result)
 
         lift = results.skill_lift
         lift_str = f"+{lift:.0%}" if lift > 0 else f"{lift:.0%}"
@@ -258,25 +303,51 @@ async def _generate_async(
             base_url=eval_base_url,
         )
 
-        # Log eval run result
+        # Log eval run results (both baseline and with-skill)
         if log_runs and run_folder:
-            run_result = RunResult(
+            # Log baseline result
+            baseline_result = RunResult(
                 metadata=RunMetadata(
                     model=eval_model,
                     task=task,
                     batch_id=batch_id or "",
-                    run_number=config.max_refine_attempts + 1,
+                    run_number=run_number,
                 ),
                 stats=ConversationStats(
-                    tokens=eval_results.with_skill_total_tokens,
+                    total_tokens=eval_results.baseline_total_tokens,
+                    turns=int(eval_results.baseline_avg_turns * len(test_cases)),
+                ),
+                passed=eval_results.baseline_success_rate > 0.5,
+                assertions_passed=int(eval_results.baseline_success_rate * len(test_cases)),
+                assertions_total=len(test_cases),
+                run_type="baseline",
+                skill_name=skill.name,
+            )
+            write_run_result(run_folder, baseline_result)
+            run_results.append(baseline_result)
+
+            # Log with-skill result
+            with_skill_folder = create_run_folder(batch_folder, run_number + 1)
+            with_skill_result = RunResult(
+                metadata=RunMetadata(
+                    model=eval_model,
+                    task=task,
+                    batch_id=batch_id or "",
+                    run_number=run_number + 1,
+                ),
+                stats=ConversationStats(
+                    total_tokens=eval_results.with_skill_total_tokens,
                     turns=int(eval_results.with_skill_avg_turns * len(test_cases)),
                 ),
                 passed=eval_results.is_beneficial,
                 assertions_passed=int(eval_results.with_skill_success_rate * len(test_cases)),
                 assertions_total=len(test_cases),
+                run_type="with_skill",
+                skill_name=skill.name,
             )
-            write_run_result(run_folder, run_result)
-            run_results.append(run_result)
+            write_run_metadata(with_skill_folder, with_skill_result.metadata)
+            write_run_result(with_skill_folder, with_skill_result)
+            run_results.append(with_skill_result)
 
         lift = eval_results.skill_lift
         lift_str = f"+{lift:.0%}" if lift > 0 else f"{lift:.0%}"
@@ -333,66 +404,49 @@ def _save_and_display(
     for name in skill.scripts:
         console.print(f"  scripts/{name}     (exec only)")
 
-    # Show results for both models if we have eval_results
+    # Show results with horizontal bars
     if results and eval_results:
+        # Multiple models - show each with bars
         console.print()
-        table = Table(show_header=True, title="Skill Impact by Model")
-        table.add_column("model")
-        table.add_column("baseline")
-        table.add_column("with skill")
-        table.add_column("lift")
+        for model_name, r in [(gen_model or "gen", results), (eval_model or "eval", eval_results)]:
+            console.print(f"  [bold]{model_name}[/bold]")
+            baseline_bar = _render_bar(r.baseline_success_rate)
+            with_skill_bar = _render_bar(r.with_skill_success_rate)
+            lift = r.skill_lift
+            lift_str = f"+{lift:.0%}" if lift >= 0 else f"{lift:.0%}"
+            lift_style = "green" if lift > 0 else "red" if lift < 0 else "dim"
 
-        # Generation model results
-        lift = results.skill_lift
-        lift_str = f"+{lift:.0%}" if lift > 0 else f"{lift:.0%}"
-        lift_style = "green" if lift > 0 else "red" if lift < 0 else ""
-        table.add_row(
-            gen_model or "gen",
-            f"{results.baseline_success_rate:.0%}",
-            f"{results.with_skill_success_rate:.0%}",
-            f"[{lift_style}]{lift_str}[/{lift_style}]" if lift_style else lift_str,
-        )
-
-        # Eval model results
-        lift = eval_results.skill_lift
-        lift_str = f"+{lift:.0%}" if lift > 0 else f"{lift:.0%}"
-        lift_style = "green" if lift > 0 else "red" if lift < 0 else ""
-        table.add_row(
-            eval_model or "eval",
-            f"{eval_results.baseline_success_rate:.0%}",
-            f"{eval_results.with_skill_success_rate:.0%}",
-            f"[{lift_style}]{lift_str}[/{lift_style}]" if lift_style else lift_str,
-        )
-
-        console.print(table)
+            console.print(f"    baseline   {baseline_bar}  {r.baseline_success_rate:>5.0%}")
+            console.print(
+                f"    with skill {with_skill_bar}  {r.with_skill_success_rate:>5.0%}  "
+                f"[{lift_style}]({lift_str})[/{lift_style}]"
+            )
+            console.print()
 
     elif results:
+        # Single model
         console.print()
-        table = Table(show_header=True)
-        table.add_column("")
-        table.add_column("baseline")
-        table.add_column("with skill")
-        table.add_column("")
-
+        baseline_bar = _render_bar(results.baseline_success_rate)
+        with_skill_bar = _render_bar(results.with_skill_success_rate)
         lift = results.skill_lift
-        lift_str = f"+{lift:.0%}" if lift > 0 else f"{lift:.0%}"
-        table.add_row(
-            "success",
-            f"{results.baseline_success_rate:.0%}",
-            f"{results.with_skill_success_rate:.0%}",
-            lift_str,
+        lift_str = f"+{lift:.0%}" if lift >= 0 else f"{lift:.0%}"
+        lift_style = "green" if lift > 0 else "red" if lift < 0 else "dim"
+
+        console.print(f"  baseline   {baseline_bar}  {results.baseline_success_rate:>5.0%}")
+        console.print(
+            f"  with skill {with_skill_bar}  {results.with_skill_success_rate:>5.0%}  "
+            f"[{lift_style}]({lift_str})[/{lift_style}]"
         )
 
-        savings = results.token_savings
-        savings_str = f"-{savings:.0%}" if savings > 0 else f"+{-savings:.0%}"
-        table.add_row(
-            "tokens",
-            str(results.baseline_total_tokens),
-            str(results.with_skill_total_tokens),
-            savings_str,
-        )
-
-        console.print(table)
+        if results.baseline_total_tokens > 0:
+            savings = results.token_savings
+            savings_str = f"-{savings:.0%}" if savings >= 0 else f"+{-savings:.0%}"
+            savings_style = "green" if savings > 0 else "red" if savings < 0 else "dim"
+            console.print()
+            console.print(
+                f"  tokens: {results.baseline_total_tokens} → {results.with_skill_total_tokens}  "
+                f"[{savings_style}]({savings_str})[/{savings_style}]"
+            )
 
     console.print()
     console.print(f"Saved to {output_path}")
@@ -469,18 +523,11 @@ async def _eval_async(
     config = Config.load()
     skill_dir = Path(skill_path)
 
-    skill_md = skill_dir / "SKILL.md"
-    if not skill_md.exists():
+    try:
+        skill = Skill.load(skill_dir)
+    except FileNotFoundError:
         console.print(f"[red]No SKILL.md found in {skill_dir}[/red]")
         sys.exit(1)
-
-    content = skill_md.read_text()
-    lines = content.split("\n")
-    name = lines[0].lstrip("# ").strip() if lines else "unknown"
-    description = lines[2] if len(lines) > 2 else ""
-    body = "\n".join(lines[4:]) if len(lines) > 4 else content
-
-    skill = Skill(name=name, description=description, body=body)
 
     if tests:
         with open(tests, encoding="utf-8") as f:
@@ -499,16 +546,6 @@ async def _eval_async(
     if log_runs:
         runs_path = Path(runs_dir) if runs_dir else config.runs_dir
         batch_id, batch_folder = create_batch_folder(runs_path)
-        run_folder = create_run_folder(batch_folder, 1)
-        write_run_metadata(
-            run_folder,
-            RunMetadata(
-                model=model or config.effective_eval_model,
-                task=skill.description,
-                batch_id=batch_id,
-                run_number=1,
-            ),
-        )
         console.print(f"Logging to: {batch_folder}", style="dim")
 
     provider_info = ""
@@ -528,18 +565,45 @@ async def _eval_async(
         base_url=base_url,
     )
 
-    # Log results
+    # Log results (both baseline and with-skill for plot command)
+    run_results: list[RunResult] = []
+    eval_model = model or config.effective_eval_model
     if log_runs and batch_folder:
-        run_folder = batch_folder / "run_1"
-        run_result = RunResult(
+        # Log baseline result
+        if not no_baseline:
+            baseline_folder = create_run_folder(batch_folder, 1)
+            baseline_result = RunResult(
+                metadata=RunMetadata(
+                    model=eval_model,
+                    task=skill.description,
+                    batch_id=batch_id or "",
+                    run_number=1,
+                ),
+                stats=ConversationStats(
+                    total_tokens=results.baseline_total_tokens,
+                    turns=int(results.baseline_avg_turns * len(test_cases)),
+                ),
+                passed=results.baseline_success_rate > 0.5,
+                assertions_passed=int(results.baseline_success_rate * len(test_cases)),
+                assertions_total=len(test_cases),
+                run_type="baseline",
+                skill_name=skill.name,
+            )
+            write_run_metadata(baseline_folder, baseline_result.metadata)
+            write_run_result(baseline_folder, baseline_result)
+            run_results.append(baseline_result)
+
+        # Log with-skill result
+        with_skill_folder = create_run_folder(batch_folder, 2 if not no_baseline else 1)
+        with_skill_result = RunResult(
             metadata=RunMetadata(
-                model=model or config.effective_eval_model,
+                model=eval_model,
                 task=skill.description,
                 batch_id=batch_id or "",
-                run_number=1,
+                run_number=2 if not no_baseline else 1,
             ),
             stats=ConversationStats(
-                tokens=results.with_skill_total_tokens,
+                total_tokens=results.with_skill_total_tokens,
                 turns=int(results.with_skill_avg_turns * len(test_cases)),
             ),
             passed=results.is_beneficial
@@ -547,8 +611,23 @@ async def _eval_async(
             else results.with_skill_success_rate > 0.5,
             assertions_passed=int(results.with_skill_success_rate * len(test_cases)),
             assertions_total=len(test_cases),
+            run_type="with_skill",
+            skill_name=skill.name,
         )
-        write_run_result(run_folder, run_result)
+        write_run_metadata(with_skill_folder, with_skill_result.metadata)
+        write_run_result(with_skill_folder, with_skill_result)
+        run_results.append(with_skill_result)
+
+        # Write batch summary
+        summary = BatchSummary(
+            batch_id=batch_id or "",
+            model=eval_model,
+            task=skill.description,
+            total_runs=len(run_results),
+            passed_runs=sum(1 for r in run_results if r.passed),
+            results=run_results,
+        )
+        write_batch_summary(batch_folder, summary)
 
     if verbose and not no_baseline:
         console.print()
@@ -561,44 +640,40 @@ async def _eval_async(
             console.print(f"  {i}. {input_preview}  {base_icon} base  {skill_icon} skill")
         console.print()
 
-    table = Table(show_header=True)
-    table.add_column("")
-    table.add_column("baseline")
-    table.add_column("with skill")
-    table.add_column("")
-
-    n = len(test_cases)
+    # Display results with horizontal bars
+    console.print()
     if not no_baseline:
+        baseline_rate = results.baseline_success_rate
+        with_skill_rate = results.with_skill_success_rate
         lift = results.skill_lift
-        lift_str = f"+{lift:.0%}" if lift > 0 else f"{lift:.0%}"
-        base_pass = int(results.baseline_success_rate * n)
-        skill_pass = int(results.with_skill_success_rate * n)
-        table.add_row(
-            "success",
-            f"{base_pass}/{n} ({results.baseline_success_rate:.0%})",
-            f"{skill_pass}/{n} ({results.with_skill_success_rate:.0%})",
-            lift_str,
+
+        baseline_bar = _render_bar(baseline_rate)
+        with_skill_bar = _render_bar(with_skill_rate)
+
+        lift_str = f"+{lift:.0%}" if lift >= 0 else f"{lift:.0%}"
+        lift_style = "green" if lift > 0 else "red" if lift < 0 else "dim"
+
+        console.print(f"  baseline   {baseline_bar}  {baseline_rate:>5.0%}")
+        console.print(
+            f"  with skill {with_skill_bar}  {with_skill_rate:>5.0%}  "
+            f"[{lift_style}]({lift_str})[/{lift_style}]"
         )
 
-        savings = results.token_savings
-        savings_str = f"-{savings:.0%}" if savings > 0 else f"+{-savings:.0%}"
-        table.add_row(
-            "tokens",
-            str(results.baseline_total_tokens),
-            str(results.with_skill_total_tokens),
-            savings_str,
-        )
+        # Token comparison
+        if results.baseline_total_tokens > 0:
+            savings = results.token_savings
+            savings_str = f"-{savings:.0%}" if savings >= 0 else f"+{-savings:.0%}"
+            savings_style = "green" if savings > 0 else "red" if savings < 0 else "dim"
+            console.print()
+            console.print(
+                f"  tokens: {results.baseline_total_tokens} → {results.with_skill_total_tokens}  "
+                f"[{savings_style}]({savings_str})[/{savings_style}]"
+            )
     else:
-        skill_pass = int(results.with_skill_success_rate * n)
-        table.add_row(
-            "success",
-            "-",
-            f"{skill_pass}/{n} ({results.with_skill_success_rate:.0%})",
-            "",
-        )
-        table.add_row("tokens", "-", str(results.with_skill_total_tokens), "")
-
-    console.print(table)
+        with_skill_rate = results.with_skill_success_rate
+        with_skill_bar = _render_bar(with_skill_rate)
+        console.print(f"  with skill {with_skill_bar}  {with_skill_rate:>5.0%}")
+        console.print(f"  tokens: {results.with_skill_total_tokens}")
 
     if not no_baseline:
         if results.is_beneficial:
@@ -658,6 +733,478 @@ def runs_cmd(runs_dir: str | None, csv_output: str | None):
     except FileNotFoundError as e:
         console.print(f"[red]{e}[/red]")
         sys.exit(1)
+
+
+@main.command("benchmark")
+@click.argument("skill_path", type=click.Path(exists=True))
+@click.option("-m", "--model", "models", multiple=True, required=True, help="Model to benchmark")
+@click.option("--runs", "num_runs", type=int, default=3, help="Runs per model (default: 3)")
+@click.option("-t", "--tests", type=click.Path(exists=True), help="Test cases JSON file")
+@click.option("-o", "--output", type=click.Path(), help="Output directory for results")
+@click.option("-v", "--verbose", is_flag=True, help="Show per-run details")
+def benchmark_cmd(
+    skill_path: str,
+    models: tuple[str, ...],
+    num_runs: int,
+    tests: str | None,
+    output: str | None,
+    verbose: bool,
+):
+    """Benchmark a skill across multiple models.
+
+    Runs the skill's test cases multiple times per model and reports
+    pass rates and assertion statistics. MCP servers from fastagent.config.yaml
+    are automatically enabled.
+
+    Examples:
+
+        upskill benchmark ./skills/hf-eval-extraction/ -m haiku -m sonnet
+
+        upskill benchmark ./skills/my-skill/ -m gpt-4o -m claude-sonnet --runs 5
+
+        upskill benchmark ./skills/my-skill/ -m haiku -t ./custom_tests.json -v
+    """
+    asyncio.run(
+        _benchmark_async(
+            skill_path, list(models), num_runs, tests, output, verbose
+        )
+    )
+
+
+async def _benchmark_async(
+    skill_path: str,
+    models: list[str],
+    num_runs: int,
+    tests_path: str | None,
+    output_dir: str | None,
+    verbose: bool,
+):
+    """Async implementation of benchmark command."""
+    from upskill.evaluate import run_test
+
+    config = Config.load()
+    skill = Skill.load(Path(skill_path))
+
+    # Load test cases
+    if tests_path:
+        with open(tests_path, encoding="utf-8") as f:
+            data = json.load(f)
+        if "cases" in data:
+            test_cases = [TestCase(**tc) for tc in data["cases"]]
+        else:
+            test_cases = [TestCase(**tc) for tc in data]
+    elif skill.tests:
+        test_cases = skill.tests
+    else:
+        console.print("Generating test cases from skill...", style="dim")
+        test_cases = await generate_tests(skill.description, config=config)
+
+    # Setup output directory
+    if output_dir:
+        out_path = Path(output_dir)
+    else:
+        out_path = config.runs_dir
+
+    batch_id, batch_folder = create_batch_folder(out_path)
+    console.print(f"Results will be saved to: {batch_folder}", style="dim")
+
+    # Track results per model
+    model_results: dict[str, list[RunResult]] = {m: [] for m in models}
+
+    console.print(f"\nBenchmarking [bold]{skill.name}[/bold] across {len(models)} model(s)")
+    console.print(f"  {len(test_cases)} test case(s), {num_runs} run(s) per model\n")
+
+    for model in models:
+        console.print(f"[bold]{model}[/bold]")
+
+        for run_num in range(1, num_runs + 1):
+            run_folder = create_run_folder(batch_folder, len(model_results[model]) + 1)
+
+            # Run each test case
+            total_assertions_passed = 0
+            total_assertions = 0
+            total_tokens = 0
+            total_turns = 0
+            all_passed = True
+
+            for tc_idx, tc in enumerate(test_cases, 1):
+                if verbose:
+                    console.print(f"  Running test {tc_idx}/{len(test_cases)}...", style="dim")
+
+                try:
+                    result = await run_test(
+                        tc, skill, model, config.effective_fastagent_config
+                    )
+                except Exception as e:
+                    console.print(f"  [red]Test error: {e}[/red]")
+                    result = TestResult(test_case=tc, success=False, error=str(e))
+
+                # Extract assertion counts from validation result
+                if result.validation_result:
+                    total_assertions_passed += result.validation_result.assertions_passed
+                    total_assertions += result.validation_result.assertions_total
+                    if verbose and result.validation_result.error_message:
+                        console.print(f"    Validation: {result.validation_result.error_message}", style="dim")
+                elif result.error:
+                    if verbose:
+                        console.print(f"    Error: {result.error}", style="dim")
+                    # Legacy: count as 1 assertion (failed)
+                    total_assertions += 1
+                else:
+                    # Legacy: count as 1 assertion
+                    total_assertions += 1
+                    if result.success:
+                        total_assertions_passed += 1
+
+                total_tokens += result.stats.total_tokens
+                total_turns += result.stats.turns
+
+                if not result.success:
+                    all_passed = False
+
+            # Create run result
+            run_result = RunResult(
+                metadata=RunMetadata(
+                    model=model,
+                    task=skill.description,
+                    batch_id=batch_id,
+                    run_number=run_num,
+                ),
+                stats=ConversationStats(
+                    total_tokens=total_tokens,
+                    turns=total_turns,
+                ),
+                passed=all_passed,
+                assertions_passed=total_assertions_passed,
+                assertions_total=total_assertions,
+                run_type="with_skill",
+                skill_name=skill.name,
+            )
+
+            write_run_metadata(run_folder, run_result.metadata)
+            write_run_result(run_folder, run_result)
+            model_results[model].append(run_result)
+
+            # Display progress
+            status = "[green]PASS[/green]" if all_passed else "[red]FAIL[/red]"
+            if verbose:
+                console.print(
+                    f"  Run {run_num}: {total_assertions_passed}/{total_assertions} assertions  "
+                    f"{total_tokens} tokens  {status}"
+                )
+
+        # Summary for this model
+        passes = sum(1 for r in model_results[model] if r.passed)
+        avg_assertions = (
+            sum(r.assertions_passed for r in model_results[model]) / len(model_results[model])
+            if model_results[model]
+            else 0
+        )
+        total_possible = model_results[model][0].assertions_total if model_results[model] else 0
+        console.print(
+            f"  Pass rate: {passes}/{num_runs} ({passes / num_runs:.0%})  "
+            f"Avg assertions: {avg_assertions:.1f}/{total_possible}"
+        )
+        console.print()
+
+    # Write batch summary
+    all_results = [r for results in model_results.values() for r in results]
+    summary = BatchSummary(
+        batch_id=batch_id,
+        model=",".join(models),
+        task=skill.description,
+        total_runs=len(all_results),
+        passed_runs=sum(1 for r in all_results if r.passed),
+        results=all_results,
+    )
+    write_batch_summary(batch_folder, summary)
+
+    # Final summary table
+    console.print()
+    table = Table(show_header=True, title="Benchmark Summary")
+    table.add_column("Model")
+    table.add_column("Pass Rate")
+    table.add_column("Avg Assertions")
+    table.add_column("Avg Tokens")
+
+    for model in models:
+        results = model_results[model]
+        passes = sum(1 for r in results if r.passed)
+        avg_assertions = sum(r.assertions_passed for r in results) / len(results) if results else 0
+        total_possible = results[0].assertions_total if results else 0
+        avg_tokens = sum(r.stats.total_tokens for r in results) / len(results) if results else 0
+
+        pass_style = "green" if passes == num_runs else "yellow" if passes > 0 else "red"
+        table.add_row(
+            model,
+            f"[{pass_style}]{passes}/{num_runs}[/{pass_style}]",
+            f"{avg_assertions:.1f}/{total_possible}",
+            f"{avg_tokens:.0f}",
+        )
+
+    console.print(table)
+    console.print(f"\nResults saved to: {batch_folder}")
+
+
+def _render_bar(value: float, width: int = 20, filled: str = "█", empty: str = "░") -> str:
+    """Render a horizontal progress bar."""
+    filled_count = int(value * width)
+    return filled * filled_count + empty * (width - filled_count)
+
+
+def _load_eval_results(runs_path: Path) -> list[dict]:
+    """Load eval results from batch summaries, extracting baseline vs with-skill pairs."""
+    results = []
+
+    for batch_dir in sorted(runs_path.iterdir()):
+        if not batch_dir.is_dir():
+            continue
+
+        summary_file = batch_dir / "batch_summary.json"
+        if not summary_file.exists():
+            continue
+
+        with open(summary_file, encoding="utf-8") as f:
+            summary = json.load(f)
+
+        # Group results by model and skill
+        baseline_by_key: dict[tuple[str, str], dict] = {}
+        with_skill_by_key: dict[tuple[str, str], dict] = {}
+
+        for run in summary.get("results", []):
+            model = run.get("metadata", {}).get("model", summary.get("model", "unknown"))
+            skill_name = run.get("skill_name")
+            run_type = run.get("run_type", "with_skill")
+
+            if not skill_name:
+                continue
+
+            key = (model, skill_name)
+            assertions_total = run.get("assertions_total", 1)
+            success_rate = run.get("assertions_passed", 0) / assertions_total if assertions_total else 0
+
+            entry = {
+                "model": model,
+                "skill_name": skill_name,
+                "success_rate": success_rate,
+                "tokens": run.get("stats", {}).get("total_tokens", 0),
+                "batch_id": summary.get("batch_id"),
+            }
+
+            if run_type == "baseline":
+                baseline_by_key[key] = entry
+            else:
+                with_skill_by_key[key] = entry
+
+        # Pair up baseline and with-skill results
+        for key, with_skill in with_skill_by_key.items():
+            baseline = baseline_by_key.get(key)
+            results.append({
+                "model": key[0],
+                "skill_name": key[1],
+                "baseline_rate": baseline["success_rate"] if baseline else None,
+                "with_skill_rate": with_skill["success_rate"],
+                "baseline_tokens": baseline["tokens"] if baseline else None,
+                "with_skill_tokens": with_skill["tokens"],
+                "batch_id": with_skill["batch_id"],
+                "has_baseline": baseline is not None,
+            })
+
+    return results
+
+
+@main.command("plot")
+@click.option("-d", "--dir", "runs_dir", type=click.Path(exists=True), help="Runs directory")
+@click.option("-s", "--skill", "skills", multiple=True, help="Filter by skill name(s)")
+@click.option("-m", "--model", "models", multiple=True, help="Filter by model(s)")
+@click.option(
+    "--metric",
+    type=click.Choice(["success", "tokens"]),
+    default="success",
+    help="Metric to plot",
+)
+def plot_cmd(
+    runs_dir: str | None,
+    skills: tuple[str, ...],
+    models: tuple[str, ...],
+    metric: str,
+):
+    """Plot model performance: baseline vs with-skill.
+
+    Shows horizontal bar charts comparing performance with and without skills.
+
+    Examples:
+
+        upskill plot
+
+        upskill plot -d ./runs/
+
+        upskill plot -s my-skill -m haiku -m sonnet
+
+        upskill plot --metric tokens
+    """
+    config = Config.load()
+    runs_path = Path(runs_dir) if runs_dir else config.runs_dir
+
+    if not runs_path.exists():
+        console.print(f"[red]No runs directory found at {runs_path}[/red]")
+        sys.exit(1)
+
+    # Load all eval results
+    all_results = _load_eval_results(runs_path)
+
+    if not all_results:
+        console.print("[yellow]No eval results with baseline comparisons found.[/yellow]")
+        console.print("Run 'upskill eval <skill>' to generate comparable results.")
+        sys.exit(0)
+
+    # Filter by skills and models
+    if skills:
+        all_results = [r for r in all_results if r["skill_name"] in skills]
+    if models:
+        all_results = [r for r in all_results if r["model"] in models]
+
+    if not all_results:
+        console.print("[yellow]No results match the specified filters.[/yellow]")
+        sys.exit(0)
+
+    # Aggregate by model and skill (take most recent / highest)
+    aggregated: dict[tuple[str, str], dict] = {}
+    for r in all_results:
+        key = (r["model"], r["skill_name"])
+        if key not in aggregated or r["with_skill_rate"] > aggregated[key]["with_skill_rate"]:
+            aggregated[key] = r
+
+    results_list = list(aggregated.values())
+
+    # Determine display mode
+    unique_skills = set(r["skill_name"] for r in results_list)
+    unique_models = set(r["model"] for r in results_list)
+
+    console.print()
+
+    if len(unique_skills) == 1 and len(unique_models) >= 1:
+        # Single skill, multiple models
+        skill_name = list(unique_skills)[0]
+        console.print(f"[bold]skill: {skill_name}[/bold]\n")
+
+        for r in sorted(results_list, key=lambda x: x["model"]):
+            _print_comparison_bars(r, metric)
+
+    elif len(unique_models) == 1 and len(unique_skills) >= 1:
+        # Single model, multiple skills
+        model_name = list(unique_models)[0]
+        console.print(f"[bold]model: {model_name}[/bold]\n")
+
+        for r in sorted(results_list, key=lambda x: x["skill_name"]):
+            _print_comparison_bars(r, metric, label_field="skill_name")
+
+    else:
+        # Multiple skills and models - matrix view
+        _print_matrix_view(results_list, metric)
+
+
+def _print_comparison_bars(result: dict, metric: str, label_field: str = "model") -> None:
+    """Print baseline vs with-skill comparison bars for a single result."""
+    label = result[label_field]
+    has_baseline = result.get("has_baseline", True)
+    console.print(f"[bold]{label}[/bold]")
+
+    if metric == "success":
+        with_skill_val = result["with_skill_rate"]
+        with_skill_bar = _render_bar(with_skill_val)
+
+        if has_baseline:
+            baseline_val = result["baseline_rate"]
+            lift = with_skill_val - baseline_val
+            baseline_bar = _render_bar(baseline_val)
+
+            console.print(f"  baseline   {baseline_bar}  {baseline_val:>5.0%}")
+
+            lift_str = f"+{lift:.0%}" if lift >= 0 else f"{lift:.0%}"
+            lift_style = "green" if lift > 0 else "red" if lift < 0 else "dim"
+            console.print(
+                f"  with skill {with_skill_bar}  {with_skill_val:>5.0%}  [{lift_style}]({lift_str})[/{lift_style}]"
+            )
+        else:
+            # Benchmark-only (no baseline)
+            console.print(f"  with skill {with_skill_bar}  {with_skill_val:>5.0%}  [dim](no baseline)[/dim]")
+    else:  # tokens
+        with_skill_val = result["with_skill_tokens"]
+
+        if has_baseline:
+            baseline_val = result["baseline_tokens"]
+            max_val = max(baseline_val, with_skill_val, 1)
+
+            baseline_bar = _render_bar(baseline_val / max_val)
+            with_skill_bar = _render_bar(with_skill_val / max_val)
+
+            savings = (baseline_val - with_skill_val) / baseline_val if baseline_val else 0
+            savings_str = f"-{savings:.0%}" if savings >= 0 else f"+{-savings:.0%}"
+            savings_style = "green" if savings > 0 else "red" if savings < 0 else "dim"
+
+            console.print(f"  baseline   {baseline_bar}  {baseline_val:>6}")
+            console.print(
+                f"  with skill {with_skill_bar}  {with_skill_val:>6}  [{savings_style}]({savings_str})[/{savings_style}]"
+            )
+        else:
+            # Benchmark-only (no baseline)
+            with_skill_bar = _render_bar(1.0 if with_skill_val > 0 else 0)
+            console.print(f"  with skill {with_skill_bar}  {with_skill_val:>6}  [dim](no baseline)[/dim]")
+
+    console.print()
+
+
+def _print_matrix_view(results: list[dict], metric: str) -> None:
+    """Print a matrix view for multiple skills and models."""
+    # Get unique skills and models
+    skills = sorted(set(r["skill_name"] for r in results))
+    models = sorted(set(r["model"] for r in results))
+
+    # Build lookup
+    lookup = {(r["model"], r["skill_name"]): r for r in results}
+
+    # Create table
+    table = Table(show_header=True, title="Skill Performance Matrix")
+    table.add_column("skill", style="bold")
+
+    for model in models:
+        table.add_column(model, justify="center")
+
+    for skill in skills:
+        row = [skill]
+        for model in models:
+            r = lookup.get((model, skill))
+            if r:
+                has_baseline = r.get("has_baseline", True)
+                if metric == "success":
+                    with_skill = r["with_skill_rate"]
+                    if has_baseline:
+                        baseline = r["baseline_rate"]
+                        lift = with_skill - baseline
+                        lift_style = "green" if lift > 0 else "red" if lift < 0 else ""
+                        cell = f"{baseline:.0%}→{with_skill:.0%}"
+                        if lift_style:
+                            cell = f"[{lift_style}]{cell}[/{lift_style}]"
+                    else:
+                        cell = f"[dim]-[/dim]→{with_skill:.0%}"
+                else:
+                    with_skill = r["with_skill_tokens"]
+                    if has_baseline:
+                        baseline = r["baseline_tokens"]
+                        savings = (baseline - with_skill) / baseline if baseline else 0
+                        savings_style = "green" if savings > 0 else "red" if savings < 0 else ""
+                        cell = f"{baseline}→{with_skill}"
+                        if savings_style:
+                            cell = f"[{savings_style}]{cell}[/{savings_style}]"
+                    else:
+                        cell = f"[dim]-[/dim]→{with_skill}"
+                row.append(cell)
+            else:
+                row.append("-")
+        table.add_row(*row)
+
+    console.print(table)
 
 
 if __name__ == "__main__":

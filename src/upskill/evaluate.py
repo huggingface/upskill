@@ -3,26 +3,112 @@
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Generator
 
+import yaml
 from fast_agent import ConversationSummary, FastAgent
 
 from upskill.config import Config
+
+
+def get_servers_from_config(config_path: Path) -> list[str]:
+    """Get all MCP server names from fastagent config.
+
+    Args:
+        config_path: Path to fastagent.config.yaml
+
+    Returns:
+        List of server names defined in the config
+    """
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        servers = config.get("mcp", {}).get("servers", {})
+        return list(servers.keys())
+    except Exception:
+        return []
 from upskill.logging import extract_stats_from_summary
-from upskill.models import ConversationStats, EvalResults, Skill, TestCase, TestResult
+from upskill.models import (
+    ConversationStats,
+    EvalResults,
+    Skill,
+    TestCase,
+    TestResult,
+    ValidationResult,
+)
+from upskill.validators import get_validator
 
 PROMPT = """You are an evaluator of skills. You are given a skill and a test case. You need to evaluate the skill on the test case and return a score."""
 
-def check_expected(output: str, expected: dict | None) -> bool:
-    """Check if output matches expected conditions."""
+
+@contextmanager
+def isolated_workspace(base_dir: Path | None = None, cleanup: bool = True) -> Generator[Path]:
+    """Create an isolated workspace for a test run.
+
+    Args:
+        base_dir: Optional parent directory for the workspace
+        cleanup: Whether to clean up the workspace after (default True)
+
+    Yields:
+        Path to the temporary workspace directory
+    """
+    workspace = tempfile.mkdtemp(dir=base_dir, prefix="upskill_run_")
+    workspace_path = Path(workspace)
+    original_cwd = Path.cwd()
+    try:
+        os.chdir(workspace_path)
+        yield workspace_path
+    finally:
+        os.chdir(original_cwd)
+        if cleanup:
+            try:
+                shutil.rmtree(workspace_path, ignore_errors=True)
+            except Exception:
+                pass  # Ignore cleanup errors
+
+
+def check_expected(
+    output: str,
+    expected: dict | None,
+    workspace: Path | None = None,
+    test_case: TestCase | None = None,
+) -> tuple[bool, ValidationResult | None]:
+    """Check if output matches expected conditions.
+
+    Args:
+        output: The agent's output string
+        expected: Expected conditions dict (legacy format with "contains")
+        workspace: Optional workspace directory for file-based validation
+        test_case: Optional test case with custom validator config
+
+    Returns:
+        Tuple of (success, validation_result)
+    """
+    # Handle custom validator if specified
+    if test_case and test_case.validator:
+        validator = get_validator(test_case.validator)
+        if validator and workspace:
+            config = test_case.validator_config or {}
+            result = validator(
+                workspace=workspace,
+                output_file=test_case.output_file or "",
+                **config,
+            )
+            return result.passed, result
+
+    # Legacy: simple contains check
     if not expected:
-        return True
+        return True, None
 
     if "contains" in expected:
         if expected["contains"].lower() not in output.lower():
-            return False
+            return False, None
 
-    return True
+    return True, None
 
 
 def build_eval_agent(
@@ -59,6 +145,7 @@ def build_eval_agent(
     fast = FastAgent(
         "upskill-evaluator",
         ignore_unknown_args=True,
+        parse_cli_args=False,  # Disable CLI arg parsing to avoid conflicts with upskill CLI
         config_path=str(config_path),
     )
 
@@ -66,22 +153,23 @@ def build_eval_agent(
         instruction += f"\n\n## Skill: {skill.name}\n\n{skill.body}"
 
     # Build model string with provider prefix if needed
-    # Check if model already has a known provider prefix
     known_providers = ("anthropic.", "openai.", "generic.", "google.", "tensorzero.")
     model_str = model
     if model and effective_provider and not model.startswith(known_providers):
         model_str = f"{effective_provider}.{model}"
 
+    # Auto-enable all MCP servers from config
+    servers = get_servers_from_config(config_path)
+
+    agent_kwargs = {"name": "default", "instruction": instruction}
     if model_str:
+        agent_kwargs["model"] = model_str
+    if servers:
+        agent_kwargs["servers"] = servers
 
-        @fast.agent(name="eval_agent", instruction=instruction, model=model_str)
-        async def eval_agent():
-            return None
-    else:
-
-        @fast.agent(name="eval_agent", instruction=instruction)
-        async def eval_agent():
-            return None
+    @fast.agent(**agent_kwargs)
+    async def default_agent():
+        return None
 
     return fast
 
@@ -93,41 +181,73 @@ async def run_test(
     config_path: Path,
     provider: str | None = None,
     base_url: str | None = None,
+    use_workspace: bool | None = None,
 ) -> TestResult:
-    """Run a single test case using FastAgent."""
+    """Run a single test case using FastAgent.
+
+    Args:
+        test_case: The test case to run
+        skill: Optional skill to inject (None for baseline)
+        model: Model name
+        config_path: Path to fastagent config
+        provider: API provider override
+        base_url: Custom API endpoint override
+        use_workspace: Force workspace isolation (auto-detected from test_case.validator)
+    """
     user_content = test_case.input
     if test_case.context and "files" in test_case.context:
         for filename, content in test_case.context["files"].items():
             user_content += f"\n\n```{filename}\n{content}\n```"
 
-    try:
-        fast = build_eval_agent(config_path, skill, model, provider, base_url)
+    # Determine if we need workspace isolation
+    needs_workspace = use_workspace if use_workspace is not None else bool(test_case.validator)
 
-        async with fast.run() as agent:
-            output = await agent.eval_agent.send(user_content)
+    async def _run_in_workspace(workspace: Path | None) -> TestResult:
+        try:
+            fast = build_eval_agent(config_path, skill, model, provider, base_url)
 
-            # Extract stats from agent history using ConversationSummary
-            try:
-                history = agent.eval_agent.history()
-                summary = ConversationSummary(history)
-                stats = extract_stats_from_summary(summary)
-            except Exception:
-                # Fall back to empty stats if extraction fails
-                stats = ConversationStats()
+            output = None
+            stats = ConversationStats()
 
-        success = check_expected(output, test_case.expected)
+            async with fast.run() as agent:
+                output = await agent.default.send(user_content)
 
-        return TestResult(
-            test_case=test_case,
-            success=success,
-            output=output,
-            tokens_used=stats.total_tokens,  # Legacy field
-            turns=stats.turns,  # Legacy field
-            stats=stats,
-        )
+                # Extract stats from agent history
+                try:
+                    history = agent.default.history()
+                    summary = ConversationSummary(history)
+                    stats = extract_stats_from_summary(summary)
+                except Exception:
+                    pass  # Stats extraction may fail for some agent types
 
-    except Exception as e:
-        return TestResult(test_case=test_case, success=False, error=str(e))
+            # Check expected with custom validator support
+            if workspace and test_case.validator:
+                success, validation_result = check_expected(
+                    output or "", test_case.expected, workspace, test_case
+                )
+            else:
+                success, validation_result = check_expected(
+                    output or "", test_case.expected
+                )
+
+            return TestResult(
+                test_case=test_case,
+                success=success,
+                output=output,
+                tokens_used=stats.total_tokens,
+                turns=stats.turns,
+                stats=stats,
+                validation_result=validation_result,
+            )
+
+        except Exception as e:
+            return TestResult(test_case=test_case, success=False, error=str(e))
+
+    if needs_workspace:
+        with isolated_workspace() as workspace:
+            return await _run_in_workspace(workspace)
+    else:
+        return await _run_in_workspace(None)
 
 
 async def evaluate_skill(
