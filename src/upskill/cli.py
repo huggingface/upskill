@@ -67,7 +67,10 @@ def main():
 @click.option(
     "--eval-provider",
     type=click.Choice(["anthropic", "openai", "generic"]),
-    help="API provider for eval model (auto-detected as 'generic' when --eval-base-url is provided)",
+    help=(
+        "API provider for eval model (auto-detected as 'generic' when "
+        "--eval-base-url is provided)"
+    ),
 )
 @click.option(
     "--eval-base-url", help="Custom API endpoint for eval model (e.g., http://localhost:11434/v1)"
@@ -161,7 +164,10 @@ async def _generate_async(
     # Either improve existing skill or generate new one
     if from_skill:
         existing_skill = Skill.load(Path(from_skill))
-        console.print(f"Improving [bold]{existing_skill.name}[/bold] with {gen_model}...", style="dim")
+        console.print(
+            f"Improving [bold]{existing_skill.name}[/bold] with {gen_model}...",
+            style="dim",
+        )
         skill = await improve_skill(existing_skill, instructions=task, model=model, config=config)
     else:
         console.print(f"Generating skill with {gen_model}...", style="dim")
@@ -844,7 +850,10 @@ async def _benchmark_async(
                     total_assertions_passed += result.validation_result.assertions_passed
                     total_assertions += result.validation_result.assertions_total
                     if verbose and result.validation_result.error_message:
-                        console.print(f"    Validation: {result.validation_result.error_message}", style="dim")
+                        console.print(
+                            f"    Validation: {result.validation_result.error_message}",
+                            style="dim",
+                        )
                 elif result.error:
                     if verbose:
                         console.print(f"    Error: {result.error}", style="dim")
@@ -981,7 +990,9 @@ def _load_eval_results(runs_path: Path) -> list[dict]:
 
             key = (model, skill_name)
             assertions_total = run.get("assertions_total", 1)
-            success_rate = run.get("assertions_passed", 0) / assertions_total if assertions_total else 0
+            success_rate = (
+                run.get("assertions_passed", 0) / assertions_total if assertions_total else 0
+            )
 
             entry = {
                 "model": model,
@@ -1124,11 +1135,16 @@ def _print_comparison_bars(result: dict, metric: str, label_field: str = "model"
             lift_str = f"+{lift:.0%}" if lift >= 0 else f"{lift:.0%}"
             lift_style = "green" if lift > 0 else "red" if lift < 0 else "dim"
             console.print(
-                f"  with skill {with_skill_bar}  {with_skill_val:>5.0%}  [{lift_style}]({lift_str})[/{lift_style}]"
+                "  with skill "
+                f"{with_skill_bar}  {with_skill_val:>5.0%}  "
+                f"[{lift_style}]({lift_str})[/{lift_style}]"
             )
         else:
             # Benchmark-only (no baseline)
-            console.print(f"  with skill {with_skill_bar}  {with_skill_val:>5.0%}  [dim](no baseline)[/dim]")
+            console.print(
+                "  with skill "
+                f"{with_skill_bar}  {with_skill_val:>5.0%}  [dim](no baseline)[/dim]"
+            )
     else:  # tokens
         with_skill_val = result["with_skill_tokens"]
 
@@ -1145,12 +1161,17 @@ def _print_comparison_bars(result: dict, metric: str, label_field: str = "model"
 
             console.print(f"  baseline   {baseline_bar}  {baseline_val:>6}")
             console.print(
-                f"  with skill {with_skill_bar}  {with_skill_val:>6}  [{savings_style}]({savings_str})[/{savings_style}]"
+                "  with skill "
+                f"{with_skill_bar}  {with_skill_val:>6}  "
+                f"[{savings_style}]({savings_str})[/{savings_style}]"
             )
         else:
             # Benchmark-only (no baseline)
             with_skill_bar = _render_bar(1.0 if with_skill_val > 0 else 0)
-            console.print(f"  with skill {with_skill_bar}  {with_skill_val:>6}  [dim](no baseline)[/dim]")
+            console.print(
+                "  with skill "
+                f"{with_skill_bar}  {with_skill_val:>6}  [dim](no baseline)[/dim]"
+            )
 
     console.print()
 

@@ -5,32 +5,18 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator
 
-import yaml
 from fast_agent import ConversationSummary, FastAgent
 
 from upskill.config import Config
-
-
-def get_servers_from_config(config_path: Path) -> list[str]:
-    """Get all MCP server names from fastagent config.
-
-    Args:
-        config_path: Path to fastagent.config.yaml
-
-    Returns:
-        List of server names defined in the config
-    """
-    try:
-        with open(config_path, encoding="utf-8") as f:
-            config = yaml.safe_load(f)
-        servers = config.get("mcp", {}).get("servers", {})
-        return list(servers.keys())
-    except Exception:
-        return []
+from upskill.fastagent_integration import (
+    build_agent_from_card,
+    compose_instruction,
+    get_servers_from_config,
+)
 from upskill.logging import extract_stats_from_summary
 from upskill.models import (
     ConversationStats,
@@ -42,7 +28,10 @@ from upskill.models import (
 )
 from upskill.validators import get_validator
 
-PROMPT = """You are an evaluator of skills. You are given a skill and a test case. You need to evaluate the skill on the test case and return a score."""
+PROMPT = (
+    "You are an evaluator of skills. You are given a skill and a test case. "
+    "You need to evaluate the skill on the test case and return a score."
+)
 
 
 @contextmanager
@@ -117,7 +106,7 @@ def build_eval_agent(
     model: str | None = None,
     provider: str | None = None,
     base_url: str | None = None,
-    instruction: str | None = PROMPT,
+    instruction: str | None = None,
 ) -> FastAgent:
     """Create a FastAgent instance for running evaluation tests.
 
@@ -125,51 +114,29 @@ def build_eval_agent(
         config_path: Path to fastagent.config.yaml
         skill: Skill to inject into system prompt (None for baseline)
         model: Model name (FastAgent format or plain name)
-        provider: Provider name (anthropic, openai, generic) - prepended to model if not already present
+        provider: Provider name (anthropic, openai, generic)
+            prepended to model if not already present
         base_url: Custom API endpoint (set via environment variable)
     """
-    # Determine effective provider - default to generic if base_url provided without provider
-    effective_provider = provider
-    if base_url and not provider:
-        effective_provider = "generic"
-
-    # Set base URL via environment if provided
-    if base_url:
-        if effective_provider == "openai":
-            os.environ["OPENAI_API_BASE"] = base_url
-        elif effective_provider == "generic":
-            os.environ["GENERIC_BASE_URL"] = base_url
-        else:
-            os.environ["ANTHROPIC_BASE_URL"] = base_url
-
-    fast = FastAgent(
-        "upskill-evaluator",
-        ignore_unknown_args=True,
-        parse_cli_args=False,  # Disable CLI arg parsing to avoid conflicts with upskill CLI
-        config_path=str(config_path),
-    )
-
-    if skill:
-        instruction += f"\n\n## Skill: {skill.name}\n\n{skill.body}"
-
-    # Build model string with provider prefix if needed
-    known_providers = ("anthropic.", "openai.", "generic.", "google.", "tensorzero.")
-    model_str = model
-    if model and effective_provider and not model.startswith(known_providers):
-        model_str = f"{effective_provider}.{model}"
-
     # Auto-enable all MCP servers from config
     servers = get_servers_from_config(config_path)
 
-    agent_kwargs = {"name": "default", "instruction": instruction}
-    if model_str:
-        agent_kwargs["model"] = model_str
-    if servers:
-        agent_kwargs["servers"] = servers
+    fast = build_agent_from_card(
+        "upskill-evaluator",
+        config_path,
+        agent_name="default",
+        model=model,
+        provider=provider,
+        base_url=base_url,
+        servers=servers,
+    )
 
-    @fast.agent(**agent_kwargs)
-    async def default_agent():
-        return None
+    agent_data = fast.agents.get("default")
+    if not agent_data:
+        raise ValueError("AgentCard 'default' not found in upskill package")
+
+    base_instruction = instruction or agent_data.get("instruction") or PROMPT
+    agent_data["instruction"] = compose_instruction(base_instruction, skill)
 
     return fast
 
