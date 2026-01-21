@@ -1,3 +1,5 @@
+<img width="1920" height="1080" alt="upskill_banner" src="https://github.com/user-attachments/assets/b71fd417-7d23-4f5d-aa89-06ea6b284d1b" />
+
 # upskill
 
 Generate and evaluate agent skills using FastAgent. Create instruction documents that teach AI coding agents how to perform tasks reliably.
@@ -13,7 +15,8 @@ uvx upskill
 ## Quick Start
 
 ```bash
-# Generate a skill from a task description
+# Generate a skill from <img width="1920" height="1080" alt="upskill_banner" src="https://github.com/user-attachments/assets/4c667844-b1f1-4ee6-aee9-a6abe557fc6c" />
+a task description
 upskill generate "write good git commit messages"
 
 # Skills are saved to ./skills/{skill-name}/ by default
