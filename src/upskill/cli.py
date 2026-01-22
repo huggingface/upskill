@@ -39,6 +39,16 @@ load_dotenv()
 console = Console()
 
 
+def _render_bar(value: float, width: int = 20) -> str:
+    """Render a simple text bar for a 0-1 value."""
+    if width <= 0:
+        return ""
+    clamped = max(0.0, min(1.0, value))
+    filled = int(round(clamped * width))
+    empty = width - filled
+    return "█" * filled + "░" * empty
+
+
 @click.group()
 @click.version_option()
 def main():
@@ -198,7 +208,6 @@ async def _generate_async(
             skill = await improve_skill(existing_skill, instructions=task, generator=agent.skill_gen, model=model)
         else:
             console.print(f"Generating skill with {gen_model}...", style="dim")
-            print(agent._agents)
             skill = await generate_skill(task=task, examples=examples, generator=agent.skill_gen, model=model)
         if no_eval:
             _save_and_display(skill, output, config)
@@ -965,9 +974,7 @@ async def _benchmark_async(
             console.print()
 
         # Summary report
-        console.print("
-[bold]Benchmark Summary[/bold]
-")
+        console.print("\n[bold]Benchmark Summary[/bold]\n")
 
         for model, results in model_results.items():
             total_runs = len(results)
