@@ -2,35 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import tempfile
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator
 
-import yaml
 from fast_agent import ConversationSummary, FastAgent
+from fast_agent.agents.llm_agent import LlmAgent
 
-from upskill.config import Config
-
-
-def get_servers_from_config(config_path: Path) -> list[str]:
-    """Get all MCP server names from fastagent config.
-
-    Args:
-        config_path: Path to fastagent.config.yaml
-
-    Returns:
-        List of server names defined in the config
-    """
-    try:
-        with open(config_path, encoding="utf-8") as f:
-            config = yaml.safe_load(f)
-        servers = config.get("mcp", {}).get("servers", {})
-        return list(servers.keys())
-    except Exception:
-        return []
+from upskill.fastagent_integration import (
+    compose_instruction,
+)
 from upskill.logging import extract_stats_from_summary
 from upskill.models import (
     ConversationStats,
@@ -42,7 +27,12 @@ from upskill.models import (
 )
 from upskill.validators import get_validator
 
-PROMPT = """You are an evaluator of skills. You are given a skill and a test case. You need to evaluate the skill on the test case and return a score."""
+logger = logging.getLogger(__name__)
+
+PROMPT = (
+    "You are an evaluator of skills. You are given a skill and a test case. "
+    "You need to evaluate the skill on the test case and return a score."
+)
 
 
 @contextmanager
@@ -111,89 +101,15 @@ def check_expected(
     return True, None
 
 
-def build_eval_agent(
-    config_path: Path,
-    skill: Skill | None,
-    model: str | None = None,
-    provider: str | None = None,
-    base_url: str | None = None,
-    instruction: str | None = PROMPT,
-) -> FastAgent:
-    """Create a FastAgent instance for running evaluation tests.
-
-    Args:
-        config_path: Path to fastagent.config.yaml
-        skill: Skill to inject into system prompt (None for baseline)
-        model: Model name (FastAgent format or plain name)
-        provider: Provider name (anthropic, openai, generic) - prepended to model if not already present
-        base_url: Custom API endpoint (set via environment variable)
-    """
-    # Determine effective provider - default to generic if base_url provided without provider
-    effective_provider = provider
-    if base_url and not provider:
-        effective_provider = "generic"
-
-    # Set base URL via environment if provided
-    if base_url:
-        if effective_provider == "openai":
-            os.environ["OPENAI_API_BASE"] = base_url
-        elif effective_provider == "generic":
-            os.environ["GENERIC_BASE_URL"] = base_url
-        else:
-            os.environ["ANTHROPIC_BASE_URL"] = base_url
-
-    fast = FastAgent(
-        "upskill-evaluator",
-        ignore_unknown_args=True,
-        parse_cli_args=False,  # Disable CLI arg parsing to avoid conflicts with upskill CLI
-        config_path=str(config_path),
-    )
-
-    if skill:
-        instruction += f"\n\n## Skill: {skill.name}\n\n{skill.body}"
-
-    # Build model string with provider prefix if needed
-    known_providers = ("anthropic.", "openai.", "generic.", "google.", "tensorzero.")
-    model_str = model
-    if model and effective_provider and not model.startswith(known_providers):
-        model_str = f"{effective_provider}.{model}"
-
-    # Auto-enable all MCP servers from config
-    servers = get_servers_from_config(config_path)
-
-    agent_kwargs = {"name": "default", "instruction": instruction}
-    if model_str:
-        agent_kwargs["model"] = model_str
-    if servers:
-        agent_kwargs["servers"] = servers
-
-    @fast.agent(**agent_kwargs)
-    async def default_agent():
-        return None
-
-    return fast
-
-
-async def run_test(
+async def _run_test_with_evaluator(
     test_case: TestCase,
-    skill: Skill | None,
-    model: str,
-    config_path: Path,
-    provider: str | None = None,
-    base_url: str | None = None,
+    evaluator: LlmAgent,
+    instruction: str | None,
+    *,
     use_workspace: bool | None = None,
+    instance_name: str | None = None,
 ) -> TestResult:
-    """Run a single test case using FastAgent.
-
-    Args:
-        test_case: The test case to run
-        skill: Optional skill to inject (None for baseline)
-        model: Model name
-        config_path: Path to fastagent config
-        provider: API provider override
-        base_url: Custom API endpoint override
-        use_workspace: Force workspace isolation (auto-detected from test_case.validator)
-    """
+    """Run a single test case using a provided evaluator agent."""
     user_content = test_case.input
     if test_case.context and "files" in test_case.context:
         for filename, content in test_case.context["files"].items():
@@ -203,22 +119,22 @@ async def run_test(
     needs_workspace = use_workspace if use_workspace is not None else bool(test_case.validator)
 
     async def _run_in_workspace(workspace: Path | None) -> TestResult:
+        clone: LlmAgent | None = None
         try:
-            fast = build_eval_agent(config_path, skill, model, provider, base_url)
+            clone = await evaluator.spawn_detached_instance(name=instance_name)
+            if instruction:
+                clone.set_instruction(instruction)
 
-            output = None
+            output = await clone.send(user_content)
             stats = ConversationStats()
 
-            async with fast.run() as agent:
-                output = await agent.default.send(user_content)
-
-                # Extract stats from agent history
-                try:
-                    history = agent.default.history()
-                    summary = ConversationSummary(history)
-                    stats = extract_stats_from_summary(summary)
-                except Exception:
-                    pass  # Stats extraction may fail for some agent types
+            # Extract stats from agent history
+            try:
+                history = clone.message_history
+                summary = ConversationSummary(messages=history)
+                stats = extract_stats_from_summary(summary)
+            except Exception as exc:
+                logger.exception("Failed to extract stats from evaluator history", exc_info=exc)
 
             # Check expected with custom validator support
             if workspace and test_case.validator:
@@ -239,55 +155,104 @@ async def run_test(
                 stats=stats,
                 validation_result=validation_result,
             )
-
-        except Exception as e:
-            return TestResult(test_case=test_case, success=False, error=str(e))
+        except Exception as exc:
+            return TestResult(test_case=test_case, success=False, error=str(exc))
+        finally:
+            if clone is not None:
+                try:
+                    await clone.shutdown()
+                except Exception as exc:
+                    logger.exception("Failed to shutdown evaluator clone", exc_info=exc)
 
     if needs_workspace:
         with isolated_workspace() as workspace:
             return await _run_in_workspace(workspace)
-    else:
-        return await _run_in_workspace(None)
+    return await _run_in_workspace(None)
+
+
+async def run_test(
+    test_case: TestCase,
+    fast: FastAgent,
+    skill: Skill | None,
+    model: str,
+    config_path: Path,
+    use_workspace: bool | None = None,
+) -> TestResult:
+    """Run a single test case using FastAgent.
+
+    Args:
+        test_case: The test case to run
+        skill: Optional skill to inject (None for baseline)
+        model: Model name
+        config_path: Path to fastagent config
+        use_workspace: Force workspace isolation (auto-detected from test_case.validator)
+    """
+
+
+    try:
+        evaluator = fast.app.evaluator
+        instruction = compose_instruction(evaluator.instruction, skill) if skill else None
+        return await _run_test_with_evaluator(
+            test_case,
+            evaluator,
+            instruction,
+            use_workspace=use_workspace,
+        )
+    except Exception as exc:
+        return TestResult(test_case=test_case, success=False, error=str(exc))
 
 
 async def evaluate_skill(
     skill: Skill,
     test_cases: list[TestCase],
+    evaluator: LlmAgent,
     model: str | None = None,
-    config: Config | None = None,
     run_baseline: bool = True,
-    provider: str | None = None,
-    base_url: str | None = None,
 ) -> EvalResults:
     """Evaluate a skill against test cases using FastAgent.
 
     Args:
         skill: The skill to evaluate
         test_cases: Test cases to run
+        evaluator: Evaluator agent to run the test cases
         model: Model to evaluate on (defaults to config.eval_model)
-        config: Configuration
         run_baseline: Whether to also run without the skill
-        provider: API provider (anthropic, openai, generic) - overrides config
-        base_url: Custom API endpoint - overrides config
 
     Returns:
         EvalResults comparing skill vs baseline
     """
-    config = config or Config.load()
-    model = model or config.effective_eval_model
-    config_path = config.effective_fastagent_config
+    # config = config or Config.load()
+    # model = model or config.effective_eval_model
+    # config_path = config.effective_fastagent_config
 
     results = EvalResults(skill_name=skill.name, model=model)
 
+    # fast = build_fast_agent(
+    #     "upskill-evaluator",
+    #     config_path,
+    #     model=model,
+    # )
+
+    base_instruction = evaluator.instruction
+
     # Run with skill
-    for tc in test_cases:
-        result = await run_test(tc, skill, model, config_path, provider, base_url)
+    skill_instruction = compose_instruction(base_instruction, skill)
+    for index, tc in enumerate(test_cases, start=1):
+        instance_name = f"{evaluator.name}[skill-{index}]"
+        result = await _run_test_with_evaluator(
+            tc,
+            evaluator,
+            skill_instruction,
+            instance_name=instance_name,
+        )
         results.with_skill_results.append(result)
 
     # Calculate with-skill metrics
     successes = sum(1 for r in results.with_skill_results if r.success)
     results.with_skill_success_rate = successes / len(test_cases) if test_cases else 0
-    results.with_skill_total_tokens = sum(r.stats.total_tokens for r in results.with_skill_results)
+    results.with_skill_total_tokens = sum(
+        r.stats.total_tokens for r in results.with_skill_results
+    )
     results.with_skill_avg_turns = (
         sum(r.stats.turns for r in results.with_skill_results) / len(test_cases)
         if test_cases
@@ -296,13 +261,21 @@ async def evaluate_skill(
 
     # Run baseline if requested
     if run_baseline:
-        for tc in test_cases:
-            result = await run_test(tc, None, model, config_path, provider, base_url)
+        for index, tc in enumerate(test_cases, start=1):
+            instance_name = f"{evaluator.name}[baseline-{index}]"
+            result = await _run_test_with_evaluator(
+                tc,
+                evaluator,
+                instruction=None,
+                instance_name=instance_name,
+            )
             results.baseline_results.append(result)
 
         successes = sum(1 for r in results.baseline_results if r.success)
         results.baseline_success_rate = successes / len(test_cases) if test_cases else 0
-        results.baseline_total_tokens = sum(r.stats.total_tokens for r in results.baseline_results)
+        results.baseline_total_tokens = sum(
+            r.stats.total_tokens for r in results.baseline_results
+        )
         results.baseline_avg_turns = (
             sum(r.stats.turns for r in results.baseline_results) / len(test_cases)
             if test_cases
