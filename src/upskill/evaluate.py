@@ -16,7 +16,6 @@ from upskill.config import Config
 from upskill.fastagent_integration import (
     build_agent_from_card,
     compose_instruction,
-    get_servers_from_config,
 )
 from upskill.logging import extract_stats_from_summary
 from upskill.models import (
@@ -118,20 +117,15 @@ def build_eval_agent(
         skill: Skill to inject into system prompt (None for baseline)
         model: Model name (FastAgent format or plain name)
         provider: Provider name (anthropic, openai, generic)
-            prepended to model if not already present
         base_url: Custom API endpoint (set via environment variable)
     """
-    # Auto-enable all MCP servers from config
-    servers = get_servers_from_config(config_path)
+
 
     fast = build_agent_from_card(
         "upskill-evaluator",
         config_path,
         agent_name="evaluator",
         model=model,
-        provider=provider,
-        base_url=base_url,
-        servers=servers,
     )
 
     agent_data = fast.agents.get("evaluator")
