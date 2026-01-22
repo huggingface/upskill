@@ -95,6 +95,7 @@ def _build_skill_from_manifest(
         name=manifest.name,
         description=manifest.description,
         body=manifest.body,
+        ## treating these as future for now as skill generator doesn't generate additional artifacts
         references=references,
         scripts=scripts,
         metadata=SkillMetadata(

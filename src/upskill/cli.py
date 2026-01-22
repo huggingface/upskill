@@ -6,6 +6,7 @@ import json
 import sys
 from importlib import resources
 from pathlib import Path
+from typing import TypedDict
 
 import click
 from dotenv import load_dotenv
@@ -20,6 +21,8 @@ from upskill.logging import (
     aggregate_conversation_stats,
     create_batch_folder,
     create_run_folder,
+    load_batch_summary,
+    load_run_result,
     summarize_runs_to_csv,
     write_batch_summary,
     write_run_metadata,
@@ -47,6 +50,90 @@ def _render_bar(value: float, width: int = 20) -> str:
     filled = int(round(clamped * width))
     empty = width - filled
     return "█" * filled + "░" * empty
+
+
+class EvalPlotResult(TypedDict):
+    """Structured plot data for eval runs."""
+
+    model: str
+    skill_name: str
+    with_skill_rate: float
+    with_skill_tokens: int
+    baseline_rate: float
+    baseline_tokens: int
+    has_baseline: bool
+
+
+def _success_rate(run: RunResult) -> float:
+    """Compute a success rate from a run result."""
+    if run.assertions_total == 0:
+        return 0.0
+    return run.assertions_passed / run.assertions_total
+
+
+def _select_baseline_run(
+    baseline_runs: list[RunResult],
+    with_skill_run: RunResult,
+) -> RunResult | None:
+    """Select the most relevant baseline run for a with-skill run."""
+    if not baseline_runs:
+        return None
+    with_number = with_skill_run.metadata.run_number
+    eligible = [run for run in baseline_runs if run.metadata.run_number <= with_number]
+    if eligible:
+        return eligible[-1]
+    return baseline_runs[-1]
+
+
+def _load_eval_results(runs_path: Path) -> list[EvalPlotResult]:
+    """Load eval results from batch summaries or run folders."""
+    results: list[EvalPlotResult] = []
+    if not runs_path.exists():
+        return results
+
+    batch_folders = sorted(p for p in runs_path.iterdir() if p.is_dir())
+    for batch_folder in batch_folders:
+        run_results: list[RunResult] = []
+        summary = load_batch_summary(batch_folder)
+        if summary:
+            run_results = summary.results
+        else:
+            for run_folder in sorted(batch_folder.glob("run_*")):
+                if not run_folder.is_dir():
+                    continue
+                run_result = load_run_result(run_folder)
+                if run_result:
+                    run_results.append(run_result)
+
+        if not run_results:
+            continue
+
+        grouped: dict[tuple[str, str], dict[str, list[RunResult]]] = {}
+        for run in run_results:
+            skill_name = run.skill_name or "unknown"
+            key = (run.metadata.model, skill_name)
+            grouped.setdefault(key, {"baseline": [], "with_skill": []})
+            if run.run_type == "baseline":
+                grouped[key]["baseline"].append(run)
+            else:
+                grouped[key]["with_skill"].append(run)
+
+        for (model, skill_name), runs in grouped.items():
+            baseline_runs = sorted(runs["baseline"], key=lambda r: r.metadata.run_number)
+            for with_skill_run in runs["with_skill"]:
+                baseline_run = _select_baseline_run(baseline_runs, with_skill_run)
+                result: EvalPlotResult = {
+                    "model": model,
+                    "skill_name": skill_name,
+                    "with_skill_rate": _success_rate(with_skill_run),
+                    "with_skill_tokens": with_skill_run.stats.total_tokens,
+                    "baseline_rate": _success_rate(baseline_run) if baseline_run else 0.0,
+                    "baseline_tokens": baseline_run.stats.total_tokens if baseline_run else 0,
+                    "has_baseline": baseline_run is not None,
+                }
+                results.append(result)
+
+    return results
 
 
 @click.group()
@@ -179,11 +266,12 @@ async def _generate_async(
     fast = FastAgent(
         "upskill",
         ignore_unknown_args=True,
-        ## NB - at the moment we let fast-agent see CLI arguments, check for conflicts/consistency/behaviour required
-#        parse_cli_args=False,        
-#        config_path=str(CONFIG_PATH),
-#        environment_dir=environment_dir,
-#        skills_directory=[skills_manifest_dir],
+        # NB - at the moment we let fast-agent see CLI arguments.
+        # Check for conflicts/consistency/behaviour required.
+        # parse_cli_args=False,
+        # config_path=str(CONFIG_PATH),
+        # environment_dir=environment_dir,
+        # skills_directory=[skills_manifest_dir],
     )
 
     @fast.agent()
@@ -205,10 +293,20 @@ async def _generate_async(
                 f"Improving [bold]{existing_skill.name}[/bold] with {gen_model}...",
                 style="dim",
             )
-            skill = await improve_skill(existing_skill, instructions=task, generator=agent.skill_gen, model=model)
+            skill = await improve_skill(
+                existing_skill,
+                instructions=task,
+                generator=agent.skill_gen,
+                model=model,
+            )
         else:
             console.print(f"Generating skill with {gen_model}...", style="dim")
-            skill = await generate_skill(task=task, examples=examples, generator=agent.skill_gen, model=model)
+            skill = await generate_skill(
+                task=task,
+                examples=examples,
+                generator=agent.skill_gen,
+                model=model,
+            )
         if no_eval:
             _save_and_display(skill, output, config)
             return
@@ -979,7 +1077,9 @@ async def _benchmark_async(
         for model, results in model_results.items():
             total_runs = len(results)
             passed_runs = sum(1 for r in results if r.passed)
-            avg_tokens = sum(r.stats.total_tokens for r in results) / total_runs if total_runs else 0
+            avg_tokens = (
+                sum(r.stats.total_tokens for r in results) / total_runs if total_runs else 0
+            )
             avg_turns = sum(r.stats.turns for r in results) / total_runs if total_runs else 0
 
             pass_rate = passed_runs / total_runs if total_runs else 0
@@ -987,7 +1087,11 @@ async def _benchmark_async(
             pass_rate_style = "green" if pass_rate > 0.5 else "yellow" if pass_rate > 0 else "red"
 
             console.print(f"[bold]{model}[/bold]")
-            console.print(f"  Runs: {total_runs} | Passed: {passed_runs} ({pass_rate_str})")
+            console.print(
+                "  Runs: "
+                f"{total_runs} | Passed: {passed_runs} ([{pass_rate_style}]"
+                f"{pass_rate_str}[/{pass_rate_style}])"
+            )
             console.print(f"  Avg tokens: {avg_tokens:.0f} | Avg turns: {avg_turns:.1f}")
             console.print()
 
@@ -1095,10 +1199,14 @@ def plot_cmd(
         _print_matrix_view(results_list, metric)
 
 
-def _print_comparison_bars(result: dict, metric: str, label_field: str = "model") -> None:
+def _print_comparison_bars(
+    result: EvalPlotResult,
+    metric: str,
+    label_field: str = "model",
+) -> None:
     """Print baseline vs with-skill comparison bars for a single result."""
     label = result[label_field]
-    has_baseline = result.get("has_baseline", True)
+    has_baseline = result["has_baseline"]
     console.print(f"[bold]{label}[/bold]")
 
     if metric == "success":
@@ -1156,7 +1264,7 @@ def _print_comparison_bars(result: dict, metric: str, label_field: str = "model"
     console.print()
 
 
-def _print_matrix_view(results: list[dict], metric: str) -> None:
+def _print_matrix_view(results: list[EvalPlotResult], metric: str) -> None:
     """Print a matrix view for multiple skills and models."""
     # Get unique skills and models
     skills = sorted(set(r["skill_name"] for r in results))
@@ -1177,7 +1285,7 @@ def _print_matrix_view(results: list[dict], metric: str) -> None:
         for model in models:
             r = lookup.get((model, skill))
             if r:
-                has_baseline = r.get("has_baseline", True)
+                has_baseline = r["has_baseline"]
                 if metric == "success":
                     with_skill = r["with_skill_rate"]
                     if has_baseline:
