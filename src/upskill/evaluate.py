@@ -191,7 +191,7 @@ async def run_test(
 
     try:
         if model is not None:
-            evaluator.set_model(model)
+            await evaluator.set_model(model)
         instruction = compose_instruction(evaluator.instruction, skill) if skill else None
         return await _run_test_with_evaluator(
             test_case,
@@ -245,7 +245,7 @@ async def evaluate_skill(
         return await asyncio.gather(*tasks)
 
     if model is not None:
-        evaluator.set_model(model)
+        await evaluator.set_model(model)
 
     # Run with skill
     skill_instruction = compose_instruction(base_instruction, skill)
