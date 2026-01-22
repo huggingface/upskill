@@ -3,13 +3,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from pathlib import Path
 
-from fast_agent import FastAgent
 from fast_agent.interfaces import AgentProtocol
 
-from upskill.config import Config
-from upskill.fastagent_integration import build_fast_agent
 from upskill.models import Skill, SkillDraft, SkillMetadata, TestCase, TestCaseSuite
 
 # Few-shot examples for test generation
@@ -85,25 +81,6 @@ TEST_GENERATION_PROMPT = (
 )
 
 
-
-def build_skill_generator(config_path: Path, model: str | None = None) -> FastAgent:
-    """Create a FastAgent instance for skill generation."""
-    return build_fast_agent(
-        "upskill-generator",
-        config_path,
-        model=model,
-    )
-
-
-def build_test_generator(config_path: Path, model: str | None = None) -> FastAgent:
-    """Create a FastAgent instance for test generation."""
-    return build_fast_agent(
-        "upskill-test-generator",
-        config_path,
-        model=model,
-    )
-
-
 async def generate_skill(
     task: str,
     generator: AgentProtocol,
@@ -177,13 +154,10 @@ async def generate_tests(
 async def refine_skill(
     skill: Skill,
     failures: list[str],
+    generator: AgentProtocol,
     model: str | None = None,
-    config: Config | None = None,
 ) -> Skill:
     """Refine a skill based on evaluation failures using FastAgent."""
-    config = config or Config.load()
-    model = model or config.model
-    config_path = config.effective_fastagent_config
 
     prompt = f"""Improve this skill based on failures:
 
@@ -196,10 +170,7 @@ Failures:
 
 Output improved skill as JSON (same structure, no code blocks)."""
 
-    fast = build_skill_generator(config_path, model)
-
-    async with fast.run() as agent:
-        result, _ = await agent.skill_gen.structured(prompt, SkillDraft)
+    result, _ = await generator.structured(prompt, SkillDraft)
 
     if result is None:
         raise ValueError("Skill refinement did not return structured output.")
