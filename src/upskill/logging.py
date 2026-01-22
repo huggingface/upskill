@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fast_agent import ConversationSummary
-from fast_agent.constants import FAST_AGENT_USAGE
+from fast_agent.constants import FAST_AGENT_TIMING, FAST_AGENT_USAGE
 from fast_agent.mcp.helpers.content_helpers import get_text
 
 from upskill.models import BatchSummary, ConversationStats, RunMetadata, RunResult, TestResult
@@ -118,8 +118,6 @@ def extract_tokens_from_messages(
     output_tokens = 0
     total_tokens = 0
     usage_summaries: list[dict[str, object]] = []
-    debug_usage_blocks: list[object] = []
-    debug_printed = False
 
     for msg in messages:
         channels = getattr(msg, "channels", None)
@@ -128,8 +126,6 @@ def extract_tokens_from_messages(
 
         # Look for usage channel (fast-agent-usage)
         usage_content = channels.get(FAST_AGENT_USAGE, [])
-        if usage_content and not debug_usage_blocks:
-            debug_usage_blocks = list(usage_content)
         for content in usage_content:
             # Content may be TextContent or a serialized dict
             if isinstance(content, dict):
@@ -148,14 +144,6 @@ def extract_tokens_from_messages(
 
             turn_data = usage_data.get("turn")
             summary_data = usage_data.get("summary")
-            if debug_usage_blocks and not debug_printed:
-                print("--------------")
-                print(debug_usage_blocks)
-                print("PARSED:", usage_data)
-                print("TURN:", turn_data)
-                print("SUMMARY:", summary_data)
-                print("****************")
-                debug_printed = True
 
             if isinstance(turn_data, dict):
                 input_tokens += int(turn_data.get("input_tokens", 0) or 0)
@@ -186,6 +174,33 @@ def extract_tokens_from_messages(
     return input_tokens, output_tokens, total_tokens, usage_summaries
 
 
+
+
+
+def extract_timing_from_messages(messages: list) -> list[dict[str, object]]:
+    """Extract timing payloads from message channels."""
+    timings: list[dict[str, object]] = []
+    for msg in messages:
+        channels = getattr(msg, "channels", None)
+        if not channels:
+            continue
+        timing_content = channels.get(FAST_AGENT_TIMING, [])
+        for content in timing_content:
+            if isinstance(content, dict):
+                text = content.get("text")
+            else:
+                text = get_text(content) or getattr(content, "text", None)
+            if not text:
+                continue
+            try:
+                payload = json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(payload, dict):
+                timings.append(payload)
+    return timings
+
+
 def extract_stats_from_summary(summary: ConversationSummary) -> ConversationStats:
     """Extract conversation statistics from a FastAgent ConversationSummary.
 
@@ -214,6 +229,7 @@ def extract_stats_from_summary(summary: ConversationSummary) -> ConversationStat
     input_tokens, output_tokens, total_tokens, usage_summaries = extract_tokens_from_messages(
         summary.messages
     )
+    timing_summaries = extract_timing_from_messages(summary.messages)
 
     return ConversationStats(
         conversation_span_ms=conversation_span_ms,
@@ -230,6 +246,7 @@ def extract_stats_from_summary(summary: ConversationSummary) -> ConversationStat
         output_tokens=output_tokens,
         total_tokens=total_tokens,
         usage_summaries=usage_summaries,
+        timing_summaries=timing_summaries,
     )
 
 
@@ -252,6 +269,7 @@ def aggregate_conversation_stats(results: list[TestResult]) -> ConversationStats
         aggregate.output_tokens += stats.output_tokens
         aggregate.total_tokens += stats.total_tokens
         aggregate.usage_summaries.extend(stats.usage_summaries)
+        aggregate.timing_summaries.extend(stats.timing_summaries)
         for name, count in stats.tool_call_map.items():
             aggregate.tool_call_map[name] = aggregate.tool_call_map.get(name, 0) + count
         for name, count in stats.tool_error_map.items():
