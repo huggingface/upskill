@@ -317,7 +317,8 @@ async def _generate_async(
         # Eval loop with refinement (on generation model)
         prev_success_rate = 0.0
         results = None
-        for attempt in range(config.max_refine_attempts):
+        attempts = max(1, config.max_refine_attempts)
+        for attempt in range(attempts):
             console.print(f"Evaluating on {gen_model}... (attempt {attempt + 1})", style="dim")
 
             # Create run folder for logging (2 folders per attempt: baseline + with_skill)
@@ -403,7 +404,7 @@ async def _generate_async(
 
             prev_success_rate = results.with_skill_success_rate
 
-            if attempt < config.max_refine_attempts - 1:
+            if attempt < attempts - 1:
                 console.print("Refining...", style="dim")
                 failures = get_failure_descriptions(results)
                 skill = await refine_skill(
@@ -426,7 +427,7 @@ async def _generate_async(
             # Create run folder for eval model
             run_folder = None
             if log_runs and batch_folder:
-                run_number = config.max_refine_attempts + 1
+                run_number = attempts + 1
                 run_folder = create_run_folder(batch_folder, run_number)
                 write_run_metadata(
                     run_folder,
@@ -506,6 +507,8 @@ async def _generate_async(
 
         if results:
             skill.metadata.test_pass_rate = results.with_skill_success_rate
+        else:
+            console.print("[yellow]No evaluation results available; skipping report output.[/yellow]")
 
         _save_and_display(skill, output, config, results, eval_results, gen_model, eval_model)
 
