@@ -123,9 +123,9 @@ async def _run_test_with_evaluator(
         clone: LlmAgent | None = None
         try:
             clone = await evaluator.spawn_detached_instance(name=instance_name)
+            
             if instruction:
                 clone.set_instruction(instruction)
-
             output = await clone.send(user_content)
             stats = ConversationStats()
 
@@ -217,9 +217,6 @@ async def evaluate_skill(
     Returns:
         EvalResults comparing skill vs baseline
     """
-    # config = config or Config.load()
-    # model = model or config.effective_eval_model
-    # config_path = config.effective_fastagent_config
 
     results = EvalResults(skill_name=skill.name, model=model)
 

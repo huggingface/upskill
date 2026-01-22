@@ -10,7 +10,7 @@ from typing import TypedDict
 
 import click
 from dotenv import load_dotenv
-from fast_agent import FastAgent
+from fast_agent import FastAgent, RequestParams
 from rich.console import Console
 from rich.table import Table
 
@@ -162,17 +162,6 @@ def main():
 @click.option("-o", "--output", type=click.Path(), help="Output directory for skill")
 @click.option("--no-eval", is_flag=True, help="Skip eval and refinement")
 @click.option("--eval-model", help="Model to evaluate skill on (different from generation model)")
-@click.option(
-    "--eval-provider",
-    type=click.Choice(["anthropic", "openai", "generic"]),
-    help=(
-        "API provider for eval model (auto-detected as 'generic' when "
-        "--eval-base-url is provided)"
-    ),
-)
-@click.option(
-    "--eval-base-url", help="Custom API endpoint for eval model (e.g., http://localhost:11434/v1)"
-)
 @click.option("--runs-dir", type=click.Path(), help="Directory for run logs (default: ./runs)")
 @click.option("--log-runs/--no-log-runs", default=True, help="Log run data (default: enabled)")
 def generate(
@@ -185,8 +174,6 @@ def generate(
     output: str | None,
     no_eval: bool,
     eval_model: str | None,
-    eval_provider: str | None,
-    eval_base_url: str | None,
     runs_dir: str | None,
     log_runs: bool,
 ):
@@ -224,8 +211,6 @@ def generate(
             output,
             no_eval,
             eval_model,
-            eval_provider,
-            eval_base_url,
             runs_dir,
             log_runs,
         )
@@ -240,8 +225,6 @@ async def _generate_async(
     output: str | None,
     no_eval: bool,
     eval_model: str | None,
-    eval_provider: str | None,
-    eval_base_url: str | None,
     runs_dir: str | None,
     log_runs: bool,
 ):
@@ -283,6 +266,18 @@ async def _generate_async(
     cards = resources.files("upskill").joinpath("agent_cards")
     with resources.as_file(cards) as cards_path:
         fast.load_agents(cards_path)
+
+
+    # tidy this up later.
+    evaluator_data = fast.agents.get("evaluator")
+    if evaluator_data and eval_model:
+        fa_config = evaluator_data.get("config")
+        if fa_config:
+            fa_config.model = eval_model
+            if fa_config.default_request_params is not None:
+                params = fa_config.default_request_params.model_dump(exclude={"model", "maxTokens"})
+                fa_config.default_request_params = RequestParams(**params)
+
 
     skill: Skill | None = None
     results = None
@@ -423,12 +418,7 @@ async def _generate_async(
         # If eval_model specified, also eval on that model
         eval_results = None
         if eval_model:
-            provider_info = ""
-            if eval_provider:
-                provider_info += f" via {eval_provider}"
-            if eval_base_url:
-                provider_info += f" @ {eval_base_url}"
-            console.print(f"Evaluating on {eval_model}{provider_info}...", style="dim")
+            console.print(f"Evaluating on {eval_model}...", style="dim")
 
             # Create run folder for eval model
             run_folder = None
