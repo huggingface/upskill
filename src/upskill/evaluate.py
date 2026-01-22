@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -10,7 +11,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
-from fast_agent import ConversationSummary, FastAgent
+from fast_agent import ConversationSummary
 from fast_agent.agents.llm_agent import LlmAgent
 
 from upskill.fastagent_integration import (
@@ -122,9 +123,9 @@ async def _run_test_with_evaluator(
         clone: LlmAgent | None = None
         try:
             clone = await evaluator.spawn_detached_instance(name=instance_name)
+            
             if instruction:
                 clone.set_instruction(instruction)
-
             output = await clone.send(user_content)
             stats = ConversationStats()
 
@@ -172,25 +173,20 @@ async def _run_test_with_evaluator(
 
 async def run_test(
     test_case: TestCase,
-    fast: FastAgent,
+    evaluator: LlmAgent,
     skill: Skill | None,
-    model: str,
-    config_path: Path,
     use_workspace: bool | None = None,
 ) -> TestResult:
-    """Run a single test case using FastAgent.
+    """Run a single test case using an evaluator agent.
 
     Args:
         test_case: The test case to run
+        evaluator: Evaluator agent to run the test case
         skill: Optional skill to inject (None for baseline)
-        model: Model name
-        config_path: Path to fastagent config
         use_workspace: Force workspace isolation (auto-detected from test_case.validator)
     """
 
-
     try:
-        evaluator = fast.app.evaluator
         instruction = compose_instruction(evaluator.instruction, skill) if skill else None
         return await _run_test_with_evaluator(
             test_case,
@@ -221,31 +217,32 @@ async def evaluate_skill(
     Returns:
         EvalResults comparing skill vs baseline
     """
-    # config = config or Config.load()
-    # model = model or config.effective_eval_model
-    # config_path = config.effective_fastagent_config
 
     results = EvalResults(skill_name=skill.name, model=model)
 
-    # fast = build_fast_agent(
-    #     "upskill-evaluator",
-    #     config_path,
-    #     model=model,
-    # )
 
     base_instruction = evaluator.instruction
 
+    async def _run_batch(
+        instruction: str | None,
+        label: str,
+    ) -> list[TestResult]:
+        tasks = []
+        for index, tc in enumerate(test_cases, start=1):
+            instance_name = f"{evaluator.name}[{label}-{index}]"
+            tasks.append(
+                _run_test_with_evaluator(
+                    tc,
+                    evaluator,
+                    instruction,
+                    instance_name=instance_name,
+                )
+            )
+        return await asyncio.gather(*tasks)
+
     # Run with skill
     skill_instruction = compose_instruction(base_instruction, skill)
-    for index, tc in enumerate(test_cases, start=1):
-        instance_name = f"{evaluator.name}[skill-{index}]"
-        result = await _run_test_with_evaluator(
-            tc,
-            evaluator,
-            skill_instruction,
-            instance_name=instance_name,
-        )
-        results.with_skill_results.append(result)
+    results.with_skill_results = await _run_batch(skill_instruction, "skill")
 
     # Calculate with-skill metrics
     successes = sum(1 for r in results.with_skill_results if r.success)
@@ -261,15 +258,7 @@ async def evaluate_skill(
 
     # Run baseline if requested
     if run_baseline:
-        for index, tc in enumerate(test_cases, start=1):
-            instance_name = f"{evaluator.name}[baseline-{index}]"
-            result = await _run_test_with_evaluator(
-                tc,
-                evaluator,
-                instruction=None,
-                instance_name=instance_name,
-            )
-            results.baseline_results.append(result)
+        results.baseline_results = await _run_batch(None, "baseline")
 
         successes = sum(1 for r in results.baseline_results if r.success)
         results.baseline_success_rate = successes / len(test_cases) if test_cases else 0

@@ -25,8 +25,8 @@ shell_execution:
 
 # Logging and Console Configuration
 logger:
-  progress_display: true
-  show_chat: true
-  show_tools: true
+  progress_display: false
+  show_chat: false
+  show_tools: false
   truncate_tools: true
   streaming: none
