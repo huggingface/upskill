@@ -269,8 +269,34 @@ async def _generate_async(
 
     async with fast.run() as agent:
 
-        # Either improve existing skill or generate new one
-        if from_skill:
+        # Generate from trace file
+        if from_trace:
+            console.print(f"Generating skill from trace: {from_trace}", style="dim")
+            trace_path = Path(from_trace)
+            with open(trace_path, encoding="utf-8") as f:
+                trace_content = f.read()
+
+            # Try to parse as JSON, otherwise use as plain text
+            if trace_path.suffix.lower() == ".json":
+                try:
+                    trace_data = json.loads(trace_content)
+                    trace_context = json.dumps(trace_data, indent=2)[:4000]
+                except json.JSONDecodeError:
+                    trace_context = trace_content[:4000]
+            else:
+                # Plain text, markdown, etc.
+                trace_context = trace_content[:4000]
+
+            task = f"{task}\n\nBased on this agent trace:\n\n{trace_context}"
+            console.print(f"Generating skill with {gen_model}...", style="dim")
+            skill = await generate_skill(
+                task=task,
+                examples=examples,
+                generator=agent.skill_gen,
+                model=model,
+            )
+        # Improve existing skill
+        elif from_skill:
             existing_skill = Skill.load(Path(from_skill))
             console.print(
                 f"Improving [bold]{existing_skill.name}[/bold] with {gen_model}...",
