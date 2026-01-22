@@ -1,14 +1,15 @@
 """CLI interface for upskill."""
-
 from __future__ import annotations
 
 import asyncio
 import json
 import sys
+from importlib import resources
 from pathlib import Path
 
 import click
 from dotenv import load_dotenv
+from fast_agent import FastAgent
 from rich.console import Console
 from rich.table import Table
 
@@ -161,211 +162,241 @@ async def _generate_async(
         batch_id, batch_folder = create_batch_folder(runs_path)
         console.print(f"Logging runs to: {batch_folder}", style="dim")
 
-    # Either improve existing skill or generate new one
-    if from_skill:
-        existing_skill = Skill.load(Path(from_skill))
-        console.print(
-            f"Improving [bold]{existing_skill.name}[/bold] with {gen_model}...",
-            style="dim",
-        )
-        skill = await improve_skill(existing_skill, instructions=task, model=model, config=config)
-    else:
-        console.print(f"Generating skill with {gen_model}...", style="dim")
-        skill = await generate_skill(task=task, examples=examples, model=model, config=config)
 
-    if no_eval:
-        _save_and_display(skill, output, config)
-        return
+    # todo -- legacy in f-a.
 
-    console.print("Generating test cases...", style="dim")
-    test_cases = await generate_tests(task, model=model, config=config)
+    
+#    agents = build_fast_agent()
+    fast = FastAgent(
+        "upskill",
+        ignore_unknown_args=True,
+        ## NB - at the moment we let fast-agent see CLI arguments, check for conflicts/consistency/behaviour required
+#        parse_cli_args=False,        
+#        config_path=str(CONFIG_PATH),
+#        environment_dir=environment_dir,
+#        skills_directory=[skills_manifest_dir],
+    )
 
-    # Eval loop with refinement (on generation model)
-    prev_success_rate = 0.0
-    results = None
-    for attempt in range(config.max_refine_attempts):
-        console.print(f"Evaluating on {gen_model}... (attempt {attempt + 1})", style="dim")
+    @fast.agent()
+    async def empty():
+        pass
+        
 
-        # Create run folder for logging (2 folders per attempt: baseline + with_skill)
-        run_folder = None
-        if log_runs and batch_folder:
-            baseline_run_num = attempt * 2 + 1
-            run_folder = create_run_folder(batch_folder, baseline_run_num)
-            write_run_metadata(
-                run_folder,
-                RunMetadata(
-                    model=gen_model,
-                    task=task,
-                    batch_id=batch_id or "",
-                    run_number=baseline_run_num,
-                ),
+    # load agents from card files
+    cards = resources.files("upskill").joinpath("agent_cards")
+    with resources.as_file(cards) as cards_path:
+        fast.load_agents(cards_path)
+
+    async with fast.run() as agent:
+
+        # Either improve existing skill or generate new one
+        if from_skill:
+            existing_skill = Skill.load(Path(from_skill))
+            console.print(
+                f"Improving [bold]{existing_skill.name}[/bold] with {gen_model}...",
+                style="dim",
+            )
+            skill = await improve_skill(existing_skill, instructions=task, generator=agent.skill_gen, model=model)
+        else:
+            console.print(f"Generating skill with {gen_model}...", style="dim")
+            print(agent._agents)
+            skill = await generate_skill(task=task, examples=examples, generator=agent.skill_gen, model=model)
+        if no_eval:
+            _save_and_display(skill, output, config)
+            return
+
+        console.print("Generating test cases...", style="dim")
+        test_cases = await generate_tests(task, generator=agent.test_gen, model=model)
+
+        # Eval loop with refinement (on generation model)
+        prev_success_rate = 0.0
+        results = None
+        for attempt in range(config.max_refine_attempts):
+            console.print(f"Evaluating on {gen_model}... (attempt {attempt + 1})", style="dim")
+
+            # Create run folder for logging (2 folders per attempt: baseline + with_skill)
+            run_folder = None
+            if log_runs and batch_folder:
+                baseline_run_num = attempt * 2 + 1
+                run_folder = create_run_folder(batch_folder, baseline_run_num)
+                write_run_metadata(
+                    run_folder,
+                    RunMetadata(
+                        model=gen_model,
+                        task=task,
+                        batch_id=batch_id or "",
+                        run_number=baseline_run_num,
+                    ),
+                )
+
+            results = await evaluate_skill(
+                skill,
+                test_cases=test_cases,
+                evaluator=agent.evaluator,
+                model=gen_model,
             )
 
-        results = await evaluate_skill(skill, test_cases, model=gen_model, config=config)
+            # Log run results (both baseline and with-skill for plot command)
+            if log_runs and run_folder:
+                # Log baseline result
+                baseline_result = RunResult(
+                    metadata=RunMetadata(
+                        model=gen_model,
+                        task=task,
+                        batch_id=batch_id or "",
+                        run_number=baseline_run_num,
+                    ),
+                    stats=aggregate_conversation_stats(results.baseline_results),
+                    passed=results.baseline_success_rate > 0.5,
+                    assertions_passed=int(results.baseline_success_rate * len(test_cases)),
+                    assertions_total=len(test_cases),
+                    run_type="baseline",
+                    skill_name=skill.name,
+                )
+                write_run_result(run_folder, baseline_result)
+                run_results.append(baseline_result)
 
-        # Log run results (both baseline and with-skill for plot command)
-        if log_runs and run_folder:
-            # Log baseline result
-            baseline_result = RunResult(
-                metadata=RunMetadata(
-                    model=gen_model,
-                    task=task,
-                    batch_id=batch_id or "",
-                    run_number=baseline_run_num,
-                ),
-                stats=aggregate_conversation_stats(results.baseline_results),
-                passed=results.baseline_success_rate > 0.5,
-                assertions_passed=int(results.baseline_success_rate * len(test_cases)),
-                assertions_total=len(test_cases),
-                run_type="baseline",
-                skill_name=skill.name,
-            )
-            write_run_result(run_folder, baseline_result)
-            run_results.append(baseline_result)
+                # Log with-skill result (in a separate folder)
+                with_skill_folder = create_run_folder(batch_folder, attempt * 2 + 2)
+                with_skill_result = RunResult(
+                    metadata=RunMetadata(
+                        model=gen_model,
+                        task=task,
+                        batch_id=batch_id or "",
+                        run_number=attempt * 2 + 2,
+                    ),
+                    stats=aggregate_conversation_stats(results.with_skill_results),
+                    passed=results.is_beneficial,
+                    assertions_passed=int(results.with_skill_success_rate * len(test_cases)),
+                    assertions_total=len(test_cases),
+                    run_type="with_skill",
+                    skill_name=skill.name,
+                )
+                write_run_metadata(with_skill_folder, with_skill_result.metadata)
+                write_run_result(with_skill_folder, with_skill_result)
+                run_results.append(with_skill_result)
 
-            # Log with-skill result (in a separate folder)
-            with_skill_folder = create_run_folder(batch_folder, attempt * 2 + 2)
-            with_skill_result = RunResult(
-                metadata=RunMetadata(
-                    model=gen_model,
-                    task=task,
-                    batch_id=batch_id or "",
-                    run_number=attempt * 2 + 2,
-                ),
-                stats=aggregate_conversation_stats(results.with_skill_results),
-                passed=results.is_beneficial,
-                assertions_passed=int(results.with_skill_success_rate * len(test_cases)),
-                assertions_total=len(test_cases),
-                run_type="with_skill",
-                skill_name=skill.name,
-            )
-            write_run_metadata(with_skill_folder, with_skill_result.metadata)
-            write_run_result(with_skill_folder, with_skill_result)
-            run_results.append(with_skill_result)
+            lift = results.skill_lift
+            lift_str = f"+{lift:.0%}" if lift > 0 else f"{lift:.0%}"
 
-        lift = results.skill_lift
-        lift_str = f"+{lift:.0%}" if lift > 0 else f"{lift:.0%}"
+            if results.is_beneficial:
+                console.print(
+                    f"  {results.baseline_success_rate:.0%} -> "
+                    f"{results.with_skill_success_rate:.0%} ({lift_str}) [green]OK[/green]"
+                )
+                break
 
-        if results.is_beneficial:
             console.print(
                 f"  {results.baseline_success_rate:.0%} -> "
-                f"{results.with_skill_success_rate:.0%} ({lift_str}) [green]OK[/green]"
-            )
-            break
-
-        console.print(
-            f"  {results.baseline_success_rate:.0%} -> "
-            f"{results.with_skill_success_rate:.0%} ({lift_str}) not good enough"
-        )
-
-        if abs(results.with_skill_success_rate - prev_success_rate) < 0.05:
-            console.print("  [yellow]Plateaued, stopping[/yellow]")
-            break
-
-        prev_success_rate = results.with_skill_success_rate
-
-        if attempt < config.max_refine_attempts - 1:
-            console.print("Refining...", style="dim")
-            failures = get_failure_descriptions(results)
-            skill = await refine_skill(skill, failures, model=model, config=config)
-
-    # If eval_model specified, also eval on that model
-    eval_results = None
-    if eval_model:
-        provider_info = ""
-        if eval_provider:
-            provider_info += f" via {eval_provider}"
-        if eval_base_url:
-            provider_info += f" @ {eval_base_url}"
-        console.print(f"Evaluating on {eval_model}{provider_info}...", style="dim")
-
-        # Create run folder for eval model
-        run_folder = None
-        if log_runs and batch_folder:
-            run_number = config.max_refine_attempts + 1
-            run_folder = create_run_folder(batch_folder, run_number)
-            write_run_metadata(
-                run_folder,
-                RunMetadata(
-                    model=eval_model,
-                    task=task,
-                    batch_id=batch_id or "",
-                    run_number=run_number,
-                ),
+                f"{results.with_skill_success_rate:.0%} ({lift_str}) not good enough"
             )
 
-        eval_results = await evaluate_skill(
-            skill,
-            test_cases,
-            model=eval_model,
-            config=config,
-            provider=eval_provider,
-            base_url=eval_base_url,
-        )
+            if abs(results.with_skill_success_rate - prev_success_rate) < 0.05:
+                console.print("  [yellow]Plateaued, stopping[/yellow]")
+                break
 
-        # Log eval run results (both baseline and with-skill)
-        if log_runs and run_folder:
-            # Log baseline result
-            baseline_result = RunResult(
-                metadata=RunMetadata(
-                    model=eval_model,
-                    task=task,
-                    batch_id=batch_id or "",
-                    run_number=run_number,
-                ),
-                stats=aggregate_conversation_stats(eval_results.baseline_results),
-                passed=eval_results.baseline_success_rate > 0.5,
-                assertions_passed=int(eval_results.baseline_success_rate * len(test_cases)),
-                assertions_total=len(test_cases),
-                run_type="baseline",
-                skill_name=skill.name,
+            prev_success_rate = results.with_skill_success_rate
+
+            if attempt < config.max_refine_attempts - 1:
+                console.print("Refining...", style="dim")
+                failures = get_failure_descriptions(results)
+                skill = await refine_skill(skill, failures, model=model, config=config)
+
+        # If eval_model specified, also eval on that model
+        eval_results = None
+        if eval_model:
+            provider_info = ""
+            if eval_provider:
+                provider_info += f" via {eval_provider}"
+            if eval_base_url:
+                provider_info += f" @ {eval_base_url}"
+            console.print(f"Evaluating on {eval_model}{provider_info}...", style="dim")
+
+            # Create run folder for eval model
+            run_folder = None
+            if log_runs and batch_folder:
+                run_number = config.max_refine_attempts + 1
+                run_folder = create_run_folder(batch_folder, run_number)
+                write_run_metadata(
+                    run_folder,
+                    RunMetadata(
+                        model=eval_model,
+                        task=task,
+                        batch_id=batch_id or "",
+                        run_number=run_number,
+                    ),
+                )
+
+            eval_results = await evaluate_skill(
+                skill,
+                test_cases,
+                evaluator=agent.evaluator,
+                model=eval_model,
             )
-            write_run_result(run_folder, baseline_result)
-            run_results.append(baseline_result)
 
-            # Log with-skill result
-            with_skill_folder = create_run_folder(batch_folder, run_number + 1)
-            with_skill_result = RunResult(
-                metadata=RunMetadata(
-                    model=eval_model,
-                    task=task,
-                    batch_id=batch_id or "",
-                    run_number=run_number + 1,
-                ),
-                stats=aggregate_conversation_stats(eval_results.with_skill_results),
-                passed=eval_results.is_beneficial,
-                assertions_passed=int(eval_results.with_skill_success_rate * len(test_cases)),
-                assertions_total=len(test_cases),
-                run_type="with_skill",
-                skill_name=skill.name,
+            # Log eval run results (both baseline and with-skill)
+            if log_runs and run_folder:
+                # Log baseline result
+                baseline_result = RunResult(
+                    metadata=RunMetadata(
+                        model=eval_model,
+                        task=task,
+                        batch_id=batch_id or "",
+                        run_number=run_number,
+                    ),
+                    stats=aggregate_conversation_stats(eval_results.baseline_results),
+                    passed=eval_results.baseline_success_rate > 0.5,
+                    assertions_passed=int(eval_results.baseline_success_rate * len(test_cases)),
+                    assertions_total=len(test_cases),
+                    run_type="baseline",
+                    skill_name=skill.name,
+                )
+                write_run_result(run_folder, baseline_result)
+                run_results.append(baseline_result)
+
+                # Log with-skill result
+                with_skill_folder = create_run_folder(batch_folder, run_number + 1)
+                with_skill_result = RunResult(
+                    metadata=RunMetadata(
+                        model=eval_model,
+                        task=task,
+                        batch_id=batch_id or "",
+                        run_number=run_number + 1,
+                    ),
+                    stats=aggregate_conversation_stats(eval_results.with_skill_results),
+                    passed=eval_results.is_beneficial,
+                    assertions_passed=int(eval_results.with_skill_success_rate * len(test_cases)),
+                    assertions_total=len(test_cases),
+                    run_type="with_skill",
+                    skill_name=skill.name,
+                )
+                write_run_metadata(with_skill_folder, with_skill_result.metadata)
+                write_run_result(with_skill_folder, with_skill_result)
+                run_results.append(with_skill_result)
+
+            lift = eval_results.skill_lift
+            lift_str = f"+{lift:.0%}" if lift > 0 else f"{lift:.0%}"
+            console.print(
+                f"  {eval_results.baseline_success_rate:.0%} -> "
+                f"{eval_results.with_skill_success_rate:.0%} ({lift_str})"
             )
-            write_run_metadata(with_skill_folder, with_skill_result.metadata)
-            write_run_result(with_skill_folder, with_skill_result)
-            run_results.append(with_skill_result)
 
-        lift = eval_results.skill_lift
-        lift_str = f"+{lift:.0%}" if lift > 0 else f"{lift:.0%}"
-        console.print(
-            f"  {eval_results.baseline_success_rate:.0%} -> "
-            f"{eval_results.with_skill_success_rate:.0%} ({lift_str})"
-        )
+        # Write batch summary
+        if log_runs and batch_folder and batch_id:
+            summary = BatchSummary(
+                batch_id=batch_id,
+                model=gen_model,
+                task=task,
+                total_runs=len(run_results),
+                passed_runs=sum(1 for r in run_results if r.passed),
+                results=run_results,
+            )
+            write_batch_summary(batch_folder, summary)
 
-    # Write batch summary
-    if log_runs and batch_folder and batch_id:
-        summary = BatchSummary(
-            batch_id=batch_id,
-            model=gen_model,
-            task=task,
-            total_runs=len(run_results),
-            passed_runs=sum(1 for r in run_results if r.passed),
-            results=run_results,
-        )
-        write_batch_summary(batch_folder, summary)
+        if results:
+            skill.metadata.test_pass_rate = results.with_skill_success_rate
 
-    if results:
-        skill.metadata.test_pass_rate = results.with_skill_success_rate
-
-    _save_and_display(skill, output, config, results, eval_results, gen_model, eval_model)
+        _save_and_display(skill, output, config, results, eval_results, gen_model, eval_model)
 
 
 def _save_and_display(
@@ -523,99 +554,121 @@ async def _eval_async(
         console.print(f"[red]No SKILL.md found in {skill_dir}[/red]")
         sys.exit(1)
 
-    if tests:
-        with open(tests, encoding="utf-8") as f:
-            data = json.load(f)
-        if "cases" in data:
-            test_cases = [TestCase(**tc) for tc in data["cases"]]
-        else:
-            test_cases = [TestCase(**tc) for tc in data]
-    else:
-        console.print("Generating test cases from skill...", style="dim")
-        test_cases = await generate_tests(skill.description, config=config)
-
-    # Setup run logging
-    batch_id = None
-    batch_folder = None
-    if log_runs:
-        runs_path = Path(runs_dir) if runs_dir else config.runs_dir
-        batch_id, batch_folder = create_batch_folder(runs_path)
-        console.print(f"Logging to: {batch_folder}", style="dim")
-
-    provider_info = ""
-    if provider:
-        provider_info += f" via {provider}"
-    if base_url:
-        provider_info += f" @ {base_url}"
-    console.print(f"Running {len(test_cases)} test cases{provider_info}...", style="dim")
-
-    results = await evaluate_skill(
-        skill,
-        test_cases,
-        model=model,
-        config=config,
-        run_baseline=not no_baseline,
-        provider=provider,
-        base_url=base_url,
+    fast = FastAgent(
+        "upskill",
+        ignore_unknown_args=True,
     )
 
-    # Log results (both baseline and with-skill for plot command)
-    run_results: list[RunResult] = []
-    eval_model = model or config.effective_eval_model
-    if log_runs and batch_folder:
-        # Log baseline result
-        if not no_baseline:
-            baseline_folder = create_run_folder(batch_folder, 1)
-            baseline_result = RunResult(
+    @fast.agent()
+    async def empty():
+        pass
+
+    cards = resources.files("upskill").joinpath("agent_cards")
+    with resources.as_file(cards) as cards_path:
+        fast.load_agents(cards_path)
+
+    results = None
+    test_cases: list[TestCase] = []
+
+    async with fast.run() as agent:
+        if tests:
+            with open(tests, encoding="utf-8") as f:
+                data = json.load(f)
+            if "cases" in data:
+                test_cases = [TestCase(**tc) for tc in data["cases"]]
+            else:
+                test_cases = [TestCase(**tc) for tc in data]
+        else:
+            console.print("Generating test cases from skill...", style="dim")
+            test_cases = await generate_tests(
+                skill.description,
+                generator=agent.test_gen,
+                model=model,
+            )
+
+        # Setup run logging
+        batch_id = None
+        batch_folder = None
+        if log_runs:
+            runs_path = Path(runs_dir) if runs_dir else config.runs_dir
+            batch_id, batch_folder = create_batch_folder(runs_path)
+            console.print(f"Logging to: {batch_folder}", style="dim")
+
+        provider_info = ""
+        if provider:
+            provider_info += f" via {provider}"
+        if base_url:
+            provider_info += f" @ {base_url}"
+        console.print(f"Running {len(test_cases)} test cases{provider_info}...", style="dim")
+
+        results = await evaluate_skill(
+            skill,
+            test_cases,
+            evaluator=agent.evaluator,
+            model=model,
+            run_baseline=not no_baseline,
+        )
+
+        # Log results (both baseline and with-skill for plot command)
+        run_results: list[RunResult] = []
+        eval_model = model or config.effective_eval_model
+        if log_runs and batch_folder:
+            # Log baseline result
+            if not no_baseline:
+                baseline_folder = create_run_folder(batch_folder, 1)
+                baseline_result = RunResult(
+                    metadata=RunMetadata(
+                        model=eval_model,
+                        task=skill.description,
+                        batch_id=batch_id or "",
+                        run_number=1,
+                    ),
+                    stats=aggregate_conversation_stats(results.baseline_results),
+                    passed=results.baseline_success_rate > 0.5,
+                    assertions_passed=int(results.baseline_success_rate * len(test_cases)),
+                    assertions_total=len(test_cases),
+                    run_type="baseline",
+                    skill_name=skill.name,
+                )
+                write_run_metadata(baseline_folder, baseline_result.metadata)
+                write_run_result(baseline_folder, baseline_result)
+                run_results.append(baseline_result)
+
+            # Log with-skill result
+            with_skill_folder = create_run_folder(batch_folder, 2 if not no_baseline else 1)
+            with_skill_result = RunResult(
                 metadata=RunMetadata(
                     model=eval_model,
                     task=skill.description,
                     batch_id=batch_id or "",
-                    run_number=1,
+                    run_number=2 if not no_baseline else 1,
                 ),
-                stats=aggregate_conversation_stats(results.baseline_results),
-                passed=results.baseline_success_rate > 0.5,
-                assertions_passed=int(results.baseline_success_rate * len(test_cases)),
+                stats=aggregate_conversation_stats(results.with_skill_results),
+                passed=results.is_beneficial
+                if not no_baseline
+                else results.with_skill_success_rate > 0.5,
+                assertions_passed=int(results.with_skill_success_rate * len(test_cases)),
                 assertions_total=len(test_cases),
-                run_type="baseline",
+                run_type="with_skill",
                 skill_name=skill.name,
             )
-            write_run_metadata(baseline_folder, baseline_result.metadata)
-            write_run_result(baseline_folder, baseline_result)
-            run_results.append(baseline_result)
+            write_run_metadata(with_skill_folder, with_skill_result.metadata)
+            write_run_result(with_skill_folder, with_skill_result)
+            run_results.append(with_skill_result)
 
-        # Log with-skill result
-        with_skill_folder = create_run_folder(batch_folder, 2 if not no_baseline else 1)
-        with_skill_result = RunResult(
-            metadata=RunMetadata(
+            # Write batch summary
+            summary = BatchSummary(
+                batch_id=batch_id or "",
                 model=eval_model,
                 task=skill.description,
-                batch_id=batch_id or "",
-                run_number=2 if not no_baseline else 1,
-            ),
-            stats=aggregate_conversation_stats(results.with_skill_results),
-            passed=results.is_beneficial
-            if not no_baseline
-            else results.with_skill_success_rate > 0.5,
-            assertions_passed=int(results.with_skill_success_rate * len(test_cases)),
-            assertions_total=len(test_cases),
-            run_type="with_skill",
-            skill_name=skill.name,
-        )
-        write_run_metadata(with_skill_folder, with_skill_result.metadata)
-        write_run_result(with_skill_folder, with_skill_result)
-        run_results.append(with_skill_result)
+                total_runs=len(run_results),
+                passed_runs=sum(1 for r in run_results if r.passed),
+                results=run_results,
+            )
+            write_batch_summary(batch_folder, summary)
 
-        # Write batch summary
-        summary = BatchSummary(
-            batch_id=batch_id or "",
-            model=eval_model,
-            task=skill.description,
-            total_runs=len(run_results),
-            passed_runs=sum(1 for r in run_results if r.passed),
-            results=run_results,
-        )
-        write_batch_summary(batch_folder, summary)
+    if results is None:
+        return
 
     if verbose and not no_baseline:
         console.print()
@@ -822,7 +875,7 @@ async def _benchmark_async(
 
                 try:
                     result = await run_test(
-                        tc, skill, model, config.effective_fastagent_config
+                        tc, fast=fast, skill=skill, model=model, config_path=config.effective_fastagent_config
                     )
                 except Exception as e:
                     console.print(f"  [red]Test error: {e}[/red]")

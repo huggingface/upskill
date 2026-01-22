@@ -1,5 +1,6 @@
 ---
 type: agent
+# note that this takes precedence over cli switch. you can set model string directly.
 model: opus
 description: Generate test cases for evaluating skills.
 ---

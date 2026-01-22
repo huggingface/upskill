@@ -6,9 +6,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from fast_agent import FastAgent
+from fast_agent.interfaces import AgentProtocol
 
 from upskill.config import Config
-from upskill.fastagent_integration import build_agent_from_card
+from upskill.fastagent_integration import build_fast_agent
 from upskill.models import Skill, SkillDraft, SkillMetadata, TestCase, TestCaseSuite
 
 # Few-shot examples for test generation
@@ -87,34 +88,32 @@ TEST_GENERATION_PROMPT = (
 
 def build_skill_generator(config_path: Path, model: str | None = None) -> FastAgent:
     """Create a FastAgent instance for skill generation."""
-    return build_agent_from_card(
+    return build_fast_agent(
         "upskill-generator",
         config_path,
-        agent_name="skill_gen",
         model=model,
     )
 
 
 def build_test_generator(config_path: Path, model: str | None = None) -> FastAgent:
     """Create a FastAgent instance for test generation."""
-    return build_agent_from_card(
+    return build_fast_agent(
         "upskill-test-generator",
         config_path,
-        agent_name="test_gen",
         model=model,
     )
 
 
 async def generate_skill(
     task: str,
+    generator: AgentProtocol,
     examples: list[str] | None = None,
     model: str | None = None,
-    config: Config | None = None,
 ) -> Skill:
     """Generate a skill from a task description using FastAgent."""
-    config = config or Config.load()
-    model = model or config.model
-    config_path = config.effective_fastagent_config
+    # config = config or Config.load()
+    # model = model or config.model
+    # config_path = config.effective_fastagent_config
 
     prompt = f"Create a skill document that teaches an AI agent how to: {task}"
     if examples:
@@ -122,13 +121,11 @@ async def generate_skill(
             f"- {ex}" for ex in examples
         )
 
-    fast = build_skill_generator(config_path, model)
 
     last_error: Exception | None = None
     result: SkillDraft | None = None
     for attempt in range(2):
-        async with fast.run() as agent:
-            result, _ = await agent.skill_gen.structured(prompt, SkillDraft)
+        result, _ = await generator.structured(prompt, SkillDraft)
 
         if result is not None:
             break
@@ -157,19 +154,19 @@ async def generate_skill(
 
 
 async def generate_tests(
-    task: str, model: str | None = None, config: Config | None = None
+    task: str,
+    generator: AgentProtocol,
+    model: str | None = None,
 ) -> list[TestCase]:
     """Generate synthetic test cases from a task description using FastAgent."""
-    config = config or Config.load()
-    model = model or config.model
-    config_path = config.effective_fastagent_config
+    # config = config or Config.load()
+    # model = model or config.model
+    # config_path = config.effective_fastagent_config
 
     prompt = TEST_GENERATION_PROMPT.replace(TASK_PLACEHOLDER, task)
 
-    fast = build_test_generator(config_path, model)
 
-    async with fast.run() as agent:
-        result, _ = await agent.test_gen.structured(prompt, TestCaseSuite)
+    result, _ = await generator.structured(prompt, TestCaseSuite)
 
     if result is None:
         raise ValueError("Test generator did not return structured test cases.")
@@ -258,8 +255,8 @@ Output ONLY the JSON, no code blocks or explanations."""
 async def improve_skill(
     skill: Skill,
     instructions: str,
+    generator: AgentProtocol,
     model: str | None = None,
-    config: Config | None = None,
 ) -> Skill:
     """Improve an existing skill based on instructions.
 
@@ -272,9 +269,8 @@ async def improve_skill(
     Returns:
         Improved Skill object
     """
-    config = config or Config.load()
-    model = model or config.model
-    config_path = config.effective_fastagent_config
+    # config = config or Config.load()
+    # model = model or config.model
 
     prompt = IMPROVE_PROMPT.format(
         name=skill.name,
@@ -283,10 +279,8 @@ async def improve_skill(
         instructions=instructions,
     )
 
-    fast = build_skill_generator(config_path, model)
 
-    async with fast.run() as agent:
-        result, _ = await agent.skill_gen.structured(prompt, SkillDraft)
+    result, _ = await generator.structured(prompt, SkillDraft)
 
     if result is None:
         raise ValueError("Skill improvement did not return structured output.")

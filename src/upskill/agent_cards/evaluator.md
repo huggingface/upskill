@@ -1,5 +1,4 @@
 ---
-type: agent
 description: Evaluate skill performance against test cases.
 skills: ["./skills"]
 # you can add mcp servers in here if needed. (reference name from config file)
