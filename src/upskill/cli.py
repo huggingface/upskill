@@ -10,7 +10,7 @@ from typing import TypedDict
 
 import click
 from dotenv import load_dotenv
-from fast_agent import FastAgent, RequestParams
+from fast_agent import FastAgent
 from rich.console import Console
 from rich.table import Table
 
@@ -244,8 +244,6 @@ async def _generate_async(
 
 
     # todo -- legacy in f-a.
-
-    
     fast = FastAgent(
         "upskill",
         ignore_unknown_args=True,
@@ -260,24 +258,11 @@ async def _generate_async(
     @fast.agent()
     async def empty():
         pass
-        
 
     # load agents from card files
     cards = resources.files("upskill").joinpath("agent_cards")
     with resources.as_file(cards) as cards_path:
         fast.load_agents(cards_path)
-
-
-    # tidy this up later.
-    evaluator_data = fast.agents.get("evaluator")
-    if evaluator_data and eval_model:
-        fa_config = evaluator_data.get("config")
-        if fa_config:
-            fa_config.model = eval_model
-            if fa_config.default_request_params is not None:
-                params = fa_config.default_request_params.model_dump(exclude={"model", "maxTokens"})
-                fa_config.default_request_params = RequestParams(**params)
-
 
     skill: Skill | None = None
     results = None
@@ -1019,6 +1004,7 @@ async def _benchmark_async(
                             tc,
                             evaluator=agent.evaluator,
                             skill=skill,
+                            model=model,
                         )
                     except Exception as e:
                         console.print(f"  [red]Test error: {e}[/red]")
