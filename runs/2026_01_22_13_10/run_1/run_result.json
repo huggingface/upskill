@@ -1,0 +1,151 @@
+{
+  "metadata": {
+    "model": "kimi",
+    "task": "write a good pr",
+    "batch_id": "2026_01_22_13_10",
+    "run_number": 1,
+    "timestamp": "2026-01-22T13:10:45.370438"
+  },
+  "stats": {
+    "conversation_span_ms": 14484.33,
+    "llm_time_ms": 14484.33,
+    "tool_time_ms": 0.0,
+    "turns": 5,
+    "tool_calls": 0,
+    "tool_errors": 0,
+    "mcp_calls": 0,
+    "execute_calls": 0,
+    "tool_call_map": {},
+    "tool_error_map": {},
+    "input_tokens": 276,
+    "output_tokens": 2837,
+    "total_tokens": 3113,
+    "usage_summaries": [
+      {
+        "model": "moonshotai/Kimi-K2-Instruct-0905",
+        "turn_count": 1,
+        "cumulative_input_tokens": 54,
+        "cumulative_output_tokens": 581,
+        "cumulative_billing_tokens": 635,
+        "cumulative_tool_use_tokens": 0,
+        "cumulative_reasoning_tokens": 0,
+        "cumulative_tool_calls": 0,
+        "current_context_tokens": 635,
+        "context_window_size": 262144,
+        "context_usage_percentage": 0.2422332763671875,
+        "cumulative_cache_read_tokens": 0,
+        "cumulative_cache_write_tokens": 0,
+        "cumulative_cache_hit_tokens": 0,
+        "cache_hit_rate_percent": 0.0,
+        "cumulative_effective_input_tokens": 54
+      },
+      {
+        "model": "moonshotai/Kimi-K2-Instruct-0905",
+        "turn_count": 1,
+        "cumulative_input_tokens": 53,
+        "cumulative_output_tokens": 114,
+        "cumulative_billing_tokens": 167,
+        "cumulative_tool_use_tokens": 0,
+        "cumulative_reasoning_tokens": 0,
+        "cumulative_tool_calls": 0,
+        "current_context_tokens": 167,
+        "context_window_size": 262144,
+        "context_usage_percentage": 0.0637054443359375,
+        "cumulative_cache_read_tokens": 0,
+        "cumulative_cache_write_tokens": 0,
+        "cumulative_cache_hit_tokens": 0,
+        "cache_hit_rate_percent": 0.0,
+        "cumulative_effective_input_tokens": 53
+      },
+      {
+        "model": "moonshotai/Kimi-K2-Instruct-0905",
+        "turn_count": 1,
+        "cumulative_input_tokens": 56,
+        "cumulative_output_tokens": 269,
+        "cumulative_billing_tokens": 325,
+        "cumulative_tool_use_tokens": 0,
+        "cumulative_reasoning_tokens": 0,
+        "cumulative_tool_calls": 0,
+        "current_context_tokens": 325,
+        "context_window_size": 262144,
+        "context_usage_percentage": 0.1239776611328125,
+        "cumulative_cache_read_tokens": 0,
+        "cumulative_cache_write_tokens": 0,
+        "cumulative_cache_hit_tokens": 0,
+        "cache_hit_rate_percent": 0.0,
+        "cumulative_effective_input_tokens": 56
+      },
+      {
+        "model": "moonshotai/Kimi-K2-Instruct-0905",
+        "turn_count": 1,
+        "cumulative_input_tokens": 56,
+        "cumulative_output_tokens": 266,
+        "cumulative_billing_tokens": 322,
+        "cumulative_tool_use_tokens": 0,
+        "cumulative_reasoning_tokens": 0,
+        "cumulative_tool_calls": 0,
+        "current_context_tokens": 322,
+        "context_window_size": 262144,
+        "context_usage_percentage": 0.122833251953125,
+        "cumulative_cache_read_tokens": 0,
+        "cumulative_cache_write_tokens": 0,
+        "cumulative_cache_hit_tokens": 0,
+        "cache_hit_rate_percent": 0.0,
+        "cumulative_effective_input_tokens": 56
+      },
+      {
+        "model": "moonshotai/Kimi-K2-Instruct-0905",
+        "turn_count": 1,
+        "cumulative_input_tokens": 57,
+        "cumulative_output_tokens": 1607,
+        "cumulative_billing_tokens": 1664,
+        "cumulative_tool_use_tokens": 0,
+        "cumulative_reasoning_tokens": 0,
+        "cumulative_tool_calls": 0,
+        "current_context_tokens": 1664,
+        "context_window_size": 262144,
+        "context_usage_percentage": 0.634765625,
+        "cumulative_cache_read_tokens": 0,
+        "cumulative_cache_write_tokens": 0,
+        "cumulative_cache_hit_tokens": 0,
+        "cache_hit_rate_percent": 0.0,
+        "cumulative_effective_input_tokens": 57
+      }
+    ],
+    "timing_summaries": [
+      {
+        "start_time": 87083.43751207,
+        "end_time": 87087.042588166,
+        "duration_ms": 3605.08
+      },
+      {
+        "start_time": 87083.457059612,
+        "end_time": 87084.288186132,
+        "duration_ms": 831.13
+      },
+      {
+        "start_time": 87083.476025419,
+        "end_time": 87084.987657765,
+        "duration_ms": 1511.63
+      },
+      {
+        "start_time": 87083.495213519,
+        "end_time": 87085.070864039,
+        "duration_ms": 1575.65
+      },
+      {
+        "start_time": 87083.513865554,
+        "end_time": 87090.474706091,
+        "duration_ms": 6960.84
+      }
+    ]
+  },
+  "passed": true,
+  "assertions_passed": 5,
+  "assertions_total": 5,
+  "error_message": null,
+  "session_id": null,
+  "session_history_file": null,
+  "run_type": "baseline",
+  "skill_name": "write-good-pr"
+}

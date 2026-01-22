@@ -1,0 +1,19 @@
+{
+  "name": "payment-processor",
+  "version": "1.0.0",
+  "description": "Payment processing module with unit tests",
+  "main": "payment-processor.js",
+  "scripts": {
+    "test": "jest",
+    "test:watch": "jest --watch"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "collectCoverage": true,
+    "coverageDirectory": "coverage",
+    "coverageReporters": ["text", "lcov", "html"]
+  }
+}

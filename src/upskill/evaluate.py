@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -225,17 +226,26 @@ async def evaluate_skill(
 
     base_instruction = evaluator.instruction
 
+    async def _run_batch(
+        instruction: str | None,
+        label: str,
+    ) -> list[TestResult]:
+        tasks = []
+        for index, tc in enumerate(test_cases, start=1):
+            instance_name = f"{evaluator.name}[{label}-{index}]"
+            tasks.append(
+                _run_test_with_evaluator(
+                    tc,
+                    evaluator,
+                    instruction,
+                    instance_name=instance_name,
+                )
+            )
+        return await asyncio.gather(*tasks)
+
     # Run with skill
     skill_instruction = compose_instruction(base_instruction, skill)
-    for index, tc in enumerate(test_cases, start=1):
-        instance_name = f"{evaluator.name}[skill-{index}]"
-        result = await _run_test_with_evaluator(
-            tc,
-            evaluator,
-            skill_instruction,
-            instance_name=instance_name,
-        )
-        results.with_skill_results.append(result)
+    results.with_skill_results = await _run_batch(skill_instruction, "skill")
 
     # Calculate with-skill metrics
     successes = sum(1 for r in results.with_skill_results if r.success)
@@ -251,15 +261,7 @@ async def evaluate_skill(
 
     # Run baseline if requested
     if run_baseline:
-        for index, tc in enumerate(test_cases, start=1):
-            instance_name = f"{evaluator.name}[baseline-{index}]"
-            result = await _run_test_with_evaluator(
-                tc,
-                evaluator,
-                instruction=None,
-                instance_name=instance_name,
-            )
-            results.baseline_results.append(result)
+        results.baseline_results = await _run_batch(None, "baseline")
 
         successes = sum(1 for r in results.baseline_results if r.success)
         results.baseline_success_rate = successes / len(test_cases) if test_cases else 0

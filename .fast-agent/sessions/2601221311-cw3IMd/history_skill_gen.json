@@ -1,0 +1,39 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Create a skill document that teaches an AI agent how to: write a good pr"
+        }
+      ],
+      "is_template": false
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "---\nname: write-good-pr-description\ndescription: Write clear, comprehensive pull request descriptions that help reviewers understand changes.\n---\n\n# Writing Effective Pull Request Descriptions\n\n## Overview\n\nA well-written PR description accelerates code review by providing context, motivation, and a clear summary of changes. This guide covers the essential elements of effective PR descriptions.\n\n## PR Template Structure\n\n```markdown\n## Summary\nBrief overview of what changed and why (2-3 sentences max)\n\n## Changes Made\n- List of specific changes\n- Use bullet points for clarity\n- Group related changes together\n\n## Type of Change\n- [ ] Bug fix\n- [ ] New feature\n- [ ] Breaking change\n- [ ] Documentation update\n\n## Testing\n- [ ] Unit tests added/updated\n- [ ] Integration tests pass\n- [ ] Manual testing completed\n- [ ] Screenshots included (for UI changes)\n\n## Checklist\n- [ ] Code follows style guidelines\n- [ ] Self-review completed\n- [ ] Comments added for complex logic\n- [ ] Documentation updated\n\n## Related Issues\nCloses #123\n```\n\n## Examples\n\n### Feature PR\n```markdown\n## Summary\nAdd user authentication using JWT tokens to secure API endpoints. This replaces the current session-based auth with stateless JWT for better scalability.\n\n## Changes Made\n- Add JWT token generation in `auth.service.ts`\n- Create middleware for token validation\n- Update login endpoint to return JWT\n- Add token refresh endpoint\n- Update API documentation\n\n## Type of Change\n- [x] New feature\n- [ ] Breaking change\n\n## Testing\n- [x] Unit tests for token generation\n- [x] Integration tests for protected routes\n- [x] Tested token expiration handling\n```\n\n### Bug Fix PR\n```markdown\n## Summary\nFixes memory leak in WebSocket connection handler that caused server crashes under high load.\n\n## Problem\nWebSocket connections weren't being properly cleaned up, leading to accumulated event listeners and memory growth.\n\n## Solution\n- Add proper cleanup in connection close handler\n- Remove all event listeners on disconnect\n- Add connection timeout (5 minutes)\n- Implement heartbeat to detect stale connections\n\nCloses #456\n```\n\n## Best Practices\n\n1. **Write for reviewers** - Assume they have no context about the problem\n2. **Keep summaries concise** - 2-3 sentences maximum\n3. **Use present tense** - \"Fixes bug\" not \"Fixed bug\"\n4. **Link related issues** - Use \"Closes #123\" or \"Related to #456\"\n5. **Include screenshots** - For UI changes, show before/after\n6. **Mark breaking changes** - Clearly highlight any breaking changes\n7. **Self-review first** - Review your own PR before requesting reviews"
+        }
+      ],
+      "channels": {
+        "fast-agent-timing": [
+          {
+            "type": "text",
+            "text": "{\"start_time\": 87107.424389168, \"end_time\": 87110.060864244, \"duration_ms\": 2636.48}"
+          }
+        ],
+        "fast-agent-usage": [
+          {
+            "type": "text",
+            "text": "{\"turn\": {\"provider\": \"openai\", \"model\": \"moonshotai/Kimi-K2-Instruct-0905\", \"input_tokens\": 1474, \"output_tokens\": 571, \"total_tokens\": 2045, \"timestamp\": 1769087465.6693375, \"cache_usage\": {\"cache_read_tokens\": 0, \"cache_write_tokens\": 0, \"cache_hit_tokens\": 0, \"total_cache_tokens\": 0, \"has_cache_activity\": false}, \"tool_use_tokens\": 0, \"reasoning_tokens\": 0, \"tool_calls\": 0, \"current_context_tokens\": 2045, \"effective_input_tokens\": 1474, \"display_input_tokens\": 1474}, \"raw_usage\": {\"completion_tokens\": 571, \"prompt_tokens\": 1474, \"total_tokens\": 2045, \"completion_tokens_details\": null, \"prompt_tokens_details\": null, \"queue_time\": 0.06277946, \"prompt_time\": 0.131343705, \"completion_time\": 2.064546671, \"total_time\": 2.195890376}, \"summary\": {\"model\": \"moonshotai/Kimi-K2-Instruct-0905\", \"turn_count\": 1, \"cumulative_input_tokens\": 1474, \"cumulative_output_tokens\": 571, \"cumulative_billing_tokens\": 2045, \"cumulative_tool_use_tokens\": 0, \"cumulative_reasoning_tokens\": 0, \"cumulative_tool_calls\": 0, \"current_context_tokens\": 2045, \"context_window_size\": 262144, \"context_usage_percentage\": 0.7801055908203125, \"cumulative_cache_read_tokens\": 0, \"cumulative_cache_write_tokens\": 0, \"cumulative_cache_hit_tokens\": 0, \"cache_hit_rate_percent\": 0.0, \"cumulative_effective_input_tokens\": 1474}}"
+          }
+        ]
+      },
+      "stop_reason": "endTurn",
+      "is_template": false
+    }
+  ]
+}
