@@ -284,6 +284,10 @@ async def _generate_async(
     with resources.as_file(cards) as cards_path:
         fast.load_agents(cards_path)
 
+    skill: Skill | None = None
+    results = None
+    eval_results = None
+
     async with fast.run() as agent:
 
         # Either improve existing skill or generate new one
@@ -335,6 +339,8 @@ async def _generate_async(
                         run_number=baseline_run_num,
                     ),
                 )
+
+            console.print("[dim]Starting evaluation run...[/dim]")
 
             results = await evaluate_skill(
                 skill,
@@ -505,12 +511,16 @@ async def _generate_async(
             )
             write_batch_summary(batch_folder, summary)
 
+    if not no_eval and skill is not None:
         if results:
             skill.metadata.test_pass_rate = results.with_skill_success_rate
         else:
             console.print("[yellow]No evaluation results available; skipping report output.[/yellow]")
 
         _save_and_display(skill, output, config, results, eval_results, gen_model, eval_model)
+
+
+
 
 
 def _save_and_display(
@@ -529,6 +539,8 @@ def _save_and_display(
         output_path = config.skills_dir / skill.name
 
     skill.save(output_path)
+
+    console.print("[dim]Rendering report output...[/dim]")
 
     console.print()
     console.print(f"  [bold]{skill.name}[/bold]")
@@ -683,6 +695,10 @@ async def _eval_async(
 
     results = None
     test_cases: list[TestCase] = []
+
+    skill: Skill | None = None
+    results = None
+    eval_results = None
 
     async with fast.run() as agent:
         if tests:
@@ -952,6 +968,10 @@ async def _benchmark_async(
     cards = resources.files("upskill").joinpath("agent_cards")
     with resources.as_file(cards) as cards_path:
         fast.load_agents(cards_path)
+
+    skill: Skill | None = None
+    results = None
+    eval_results = None
 
     async with fast.run() as agent:
         # Load test cases
