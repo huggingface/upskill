@@ -5,9 +5,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from fast_agent.interfaces import AgentProtocol
+from fast_agent.skills.registry import SkillManifest
 
 from upskill.manifest_utils import parse_skill_manifest_text
-from upskill.models import Skill, SkillDraft, SkillMetadata, TestCase, TestCaseSuite
+from upskill.models import Skill, SkillMetadata, TestCase, TestCaseSuite
 
 # Few-shot examples for test generation
 TEST_EXAMPLES = """
@@ -81,6 +82,28 @@ TEST_GENERATION_PROMPT = (
     "Focus on practical scenarios that test understanding of the core concepts."
 )
 
+def _build_skill_from_manifest(
+    manifest: SkillManifest,
+    *,
+    model: str | None,
+    source_task: str,
+    base_skill: Skill | None = None,
+) -> Skill:
+    references = base_skill.references if base_skill else {}
+    scripts = base_skill.scripts if base_skill else {}
+    return Skill(
+        name=manifest.name,
+        description=manifest.description,
+        body=manifest.body,
+        references=references,
+        scripts=scripts,
+        metadata=SkillMetadata(
+            generated_by=model,
+            generated_at=datetime.now(UTC),
+            source_task=source_task,
+        ),
+    )
+
 
 async def generate_skill(
     task: str,
@@ -100,23 +123,15 @@ async def generate_skill(
         )
 
 
-    result: SkillDraft | None = None
+    skill_text = await generator.send(prompt)
+    manifest, error = parse_skill_manifest_text(skill_text)
+    if manifest is None:
+        raise ValueError(f"Skill generator did not return valid SKILL.md: {error}")
 
-    result, _ = await generator.structured(prompt, SkillDraft)
-    skill = await generator.send(prompt)
-    manifest, _  = parse_skill_manifest_text(skill)    
-
-    return Skill(
-        name=manifest.name,
-        description=manifest.description,
-        body=manifest.body,
-        references= {},
-        scripts= {},
-        metadata=SkillMetadata(
-            generated_by=model,
-            generated_at=datetime.now(UTC),
-            source_task=task,
-        ),
+    return _build_skill_from_manifest(
+        manifest,
+        model=model,
+        source_task=task,
     )
 
 
@@ -158,24 +173,20 @@ Body: {skill.body[:500]}...
 Failures:
 {chr(10).join(f"- {f}" for f in failures[:3])}
 
-Output improved skill as JSON (same structure, no code blocks)."""
+Output a complete SKILL.md document with YAML frontmatter (name, description) and a markdown body.
+Do not wrap the output in code fences.
+"""
 
-    result, _ = await generator.structured(prompt, SkillDraft)
+    skill_text = await generator.send(prompt)
+    manifest, error = parse_skill_manifest_text(skill_text)
+    if manifest is None:
+        raise ValueError(f"Skill refinement did not return valid SKILL.md: {error}")
 
-    if result is None:
-        raise ValueError("Skill refinement did not return structured output.")
-
-    return Skill(
-        name=result.name or skill.name,
-        description=result.description or skill.description,
-        body=result.body,
-        references=result.references if result.references is not None else skill.references,
-        scripts=result.scripts if result.scripts is not None else skill.scripts,
-        metadata=SkillMetadata(
-            generated_by=model,
-            generated_at=datetime.now(UTC),
-            source_task=skill.metadata.source_task,
-        ),
+    return _build_skill_from_manifest(
+        manifest,
+        model=model,
+        source_task=skill.metadata.source_task,
+        base_skill=skill,
     )
 
 
@@ -203,14 +214,9 @@ Body:
 4. Add new examples or sections as needed
 5. Keep the skill focused and actionable
 
-Output the improved skill as JSON with this structure:
-{{
-  "name": "skill-name",
-  "description": "Brief description of what this skill teaches.",
-  "body": "The full skill document in markdown format..."
-}}
-
-Output ONLY the JSON, no code blocks or explanations."""
+Output a complete SKILL.md document with YAML frontmatter (name, description) and a markdown body.
+Do not wrap the output in code fences or JSON.
+"""
 
 
 async def improve_skill(
@@ -241,21 +247,15 @@ async def improve_skill(
     )
 
 
-    result, _ = await generator.structured(prompt, SkillDraft)
+    skill_text = await generator.send(prompt)
+    manifest, error = parse_skill_manifest_text(skill_text)
+    if manifest is None:
+        raise ValueError(f"Skill improvement did not return valid SKILL.md: {error}")
 
-    if result is None:
-        raise ValueError("Skill improvement did not return structured output.")
-
-    return Skill(
-        name=result.name or skill.name,
-        description=result.description or skill.description,
-        body=result.body,
-        references=result.references if result.references is not None else skill.references,
-        scripts=result.scripts if result.scripts is not None else skill.scripts,
-        metadata=SkillMetadata(
-            generated_by=model,
-            generated_at=datetime.now(UTC),
-            source_task=f"Improved from {skill.name}: {instructions}",
-        ),
+    return _build_skill_from_manifest(
+        manifest,
+        model=model,
+        source_task=f"Improved from {skill.name}: {instructions}",
+        base_skill=skill,
     )
 

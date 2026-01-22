@@ -17,7 +17,6 @@ Output:
 ---
 name: git-commit-messages
 description: Write clear, conventional commit messages that follow best practices.
-
 ---
 
 
@@ -242,14 +241,14 @@ def sanitize_input(value: str) -> str:
 
 Output ONLY a markdown file with frontmatter with this structure:
 
-```markdown
 ---
 name: skill-name
 description: What this skill teaches
 ---
 Markdown instructions
 
-```
+
+
 
 ## Field Requirements
 
