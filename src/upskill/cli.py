@@ -304,13 +304,22 @@ async def _generate_async(
         # Generate from trace file
         if from_trace:
             console.print(f"Generating skill from trace: {from_trace}", style="dim")
-            # TODO: Implement trace-based skill generation
-            # For now, read trace and use it as context for generation
-            with open(from_trace, encoding="utf-8") as f:
-                trace_data = json.load(f)
-            # Extract patterns from trace to inform skill generation
-            trace_context = f"Based on this agent trace: {json.dumps(trace_data, indent=2)[:2000]}"
-            task = f"{task}\n\n{trace_context}"
+            trace_path = Path(from_trace)
+            with open(trace_path, encoding="utf-8") as f:
+                trace_content = f.read()
+
+            # Try to parse as JSON, otherwise use as plain text
+            if trace_path.suffix.lower() == ".json":
+                try:
+                    trace_data = json.loads(trace_content)
+                    trace_context = json.dumps(trace_data, indent=2)[:4000]
+                except json.JSONDecodeError:
+                    trace_context = trace_content[:4000]
+            else:
+                # Plain text, markdown, etc.
+                trace_context = trace_content[:4000]
+
+            task = f"{task}\n\nBased on this agent trace:\n\n{trace_context}"
             console.print(f"Generating skill with {gen_model}...", style="dim")
             skill = await generate_skill(
                 task=task,
