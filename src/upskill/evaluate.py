@@ -11,7 +11,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
-from fast_agent import ConversationSummary, RequestParams
+from fast_agent import ConversationSummary
 from fast_agent.agents.llm_agent import LlmAgent
 
 from upskill.fastagent_integration import (
@@ -106,7 +106,6 @@ async def _run_test_with_evaluator(
     test_case: TestCase,
     evaluator: LlmAgent,
     instruction: str | None,
-    request_params: RequestParams | None,
     *,
     use_workspace: bool | None = None,
     instance_name: str | None = None,
@@ -129,7 +128,7 @@ async def _run_test_with_evaluator(
                 clone.set_instruction("")
             else:
                 clone.set_instruction(instruction)
-            output = await clone.send(user_content, request_params=request_params)
+            output = await clone.send(user_content)
             stats = ConversationStats()
 
             # Extract stats from agent history
@@ -191,13 +190,13 @@ async def run_test(
     """
 
     try:
+        if model is not None:
+            evaluator.set_model(model)
         instruction = compose_instruction(evaluator.instruction, skill) if skill else None
-        request_params = RequestParams(model=model) if model else None
         return await _run_test_with_evaluator(
             test_case,
             evaluator,
             instruction,
-            request_params=request_params,
             use_workspace=use_workspace,
         )
     except Exception as exc:
@@ -231,8 +230,6 @@ async def evaluate_skill(
     async def _run_batch(
         instruction: str | None,
         label: str,
-        *,
-        request_params: RequestParams | None,
     ) -> list[TestResult]:
         tasks = []
         for index, tc in enumerate(test_cases, start=1):
@@ -242,19 +239,17 @@ async def evaluate_skill(
                     tc,
                     evaluator,
                     instruction,
-                    request_params=request_params,
                     instance_name=instance_name,
                 )
             )
         return await asyncio.gather(*tasks)
 
-    request_params = RequestParams(model=model) if model else None
+    if model is not None:
+        evaluator.set_model(model)
 
     # Run with skill
     skill_instruction = compose_instruction(base_instruction, skill)
-    results.with_skill_results = await _run_batch(
-        skill_instruction, "skill", request_params=request_params
-    )
+    results.with_skill_results = await _run_batch(skill_instruction, "skill")
 
     # Calculate with-skill metrics
     successes = sum(1 for r in results.with_skill_results if r.success)
@@ -270,9 +265,7 @@ async def evaluate_skill(
 
     # Run baseline if requested
     if run_baseline:
-        results.baseline_results = await _run_batch(
-            None, "baseline", request_params=request_params
-        )
+        results.baseline_results = await _run_batch(None, "baseline")
 
         successes = sum(1 for r in results.baseline_results if r.success)
         results.baseline_success_rate = successes / len(test_cases) if test_cases else 0

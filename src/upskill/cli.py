@@ -266,7 +266,6 @@ async def _generate_async(
 
     skill: Skill | None = None
     results = None
-    eval_results = None
 
     async with fast.run() as agent:
 
@@ -490,7 +489,9 @@ async def _generate_async(
         if results:
             skill.metadata.test_pass_rate = results.with_skill_success_rate
         else:
-            console.print("[yellow]No evaluation results available; skipping report output.[/yellow]")
+            console.print(
+                "[yellow]No evaluation results available; skipping report output.[/yellow]"
+            )
 
         _save_and_display(skill, output, config, results, eval_results, gen_model, eval_model)
 
@@ -673,7 +674,6 @@ async def _eval_async(
 
     skill: Skill | None = None
     results = None
-    eval_results = None
 
     async with fast.run() as agent:
         if tests:
@@ -946,7 +946,6 @@ async def _benchmark_async(
 
     skill: Skill | None = None
     results = None
-    eval_results = None
 
     async with fast.run() as agent:
         # Load test cases
