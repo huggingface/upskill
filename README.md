@@ -1,8 +1,8 @@
 <img width="1920" height="1080" alt="upskill_banner" src="https://github.com/user-attachments/assets/b71fd417-7d23-4f5d-aa89-06ea6b284d1b" />
 
-# upskill
+# UPskill
 
-Generate and evaluate agent skills based on traces with agents. Create skills that teach cheaper or smaller agents to perform harder tasks reliably.
+Generate and evaluate agent skills based on traces with agents. Create skills with teacher models (expensive/slow) that student models (cheap/fast) can use to perform harder tasks reliably.
 
 ## Quick Start
 
