@@ -25,7 +25,6 @@ from upskill.logging import (
 )
 from upskill.models import (
     BatchSummary,
-    ConversationStats,
     RunMetadata,
     RunResult,
     Skill,
