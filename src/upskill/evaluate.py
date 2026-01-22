@@ -15,7 +15,6 @@ from fast_agent import ConversationSummary, FastAgent
 from upskill.config import Config
 from upskill.fastagent_integration import (
     build_agent_from_card,
-    compose_instruction,
 )
 from upskill.logging import extract_stats_from_summary
 from upskill.models import (
@@ -127,13 +126,6 @@ def build_eval_agent(
         agent_name="evaluator",
         model=model,
     )
-
-    agent_data = fast.agents.get("evaluator")
-    if not agent_data:
-        raise ValueError("AgentCard 'evaluator' not found in upskill package")
-
-    base_instruction = instruction or agent_data.get("instruction") or PROMPT
-    agent_data["instruction"] = compose_instruction(base_instruction, skill)
 
     return fast
 

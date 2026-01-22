@@ -46,6 +46,24 @@ class TestCase(BaseModel):
     validator_config: dict | None = None  # Config passed to validator
 
 
+
+
+class TestCaseSuite(BaseModel):
+    """Structured container for a list of test cases."""
+
+    cases: list[TestCase] = Field(default_factory=list)
+
+
+class SkillDraft(BaseModel):
+    """Structured output model for skill generation responses."""
+
+    name: str
+    description: str
+    body: str
+    references: dict[str, str] | None = None
+    scripts: dict[str, str] | None = None
+
+
 class Skill(BaseModel):
     """A generated agent skill following the Claude Code SKILL.md spec."""
 

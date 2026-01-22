@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -11,7 +9,7 @@ from fast_agent import FastAgent
 
 from upskill.config import Config
 from upskill.fastagent_integration import build_agent_from_card
-from upskill.models import Skill, SkillMetadata, TestCase
+from upskill.models import Skill, SkillDraft, SkillMetadata, TestCase, TestCaseSuite
 
 # Few-shot examples for test generation
 TEST_EXAMPLES = """
@@ -21,44 +19,48 @@ Task: "Write good git commit messages"
 
 Output:
 ```json
-[
-  {
-    "input": "Write a commit message for adding a new login feature",
-    "expected": {"contains": "feat"}
-  },
-  {
-    "input": "Write a commit message for fixing a null pointer bug in the user service",
-    "expected": {"contains": "fix"}
-  },
-  {
-    "input": "Write a commit message for updating the README documentation",
-    "expected": {"contains": "docs"}
-  },
-  {
-    "input": "Write a commit message for a breaking API change",
-    "expected": {"contains": "BREAKING"}
-  }
-]
+{
+  "cases": [
+    {
+      "input": "Write a commit message for adding a new login feature",
+      "expected": {"contains": "feat"}
+    },
+    {
+      "input": "Write a commit message for fixing a null pointer bug in the user service",
+      "expected": {"contains": "fix"}
+    },
+    {
+      "input": "Write a commit message for updating the README documentation",
+      "expected": {"contains": "docs"}
+    },
+    {
+      "input": "Write a commit message for a breaking API change",
+      "expected": {"contains": "BREAKING"}
+    }
+  ]
+}
 ```
 
 Task: "Handle API errors gracefully in Python"
 
 Output:
 ```json
-[
-  {
-    "input": "Write code to fetch data from an API with retry logic",
-    "expected": {"contains": "retry"}
-  },
-  {
-    "input": "How should I handle a 500 error from an API?",
-    "expected": {"contains": "backoff"}
-  },
-  {
-    "input": "Write error handling for a requests.get call",
-    "expected": {"contains": "except"}
-  }
-]
+{
+  "cases": [
+    {
+      "input": "Write code to fetch data from an API with retry logic",
+      "expected": {"contains": "retry"}
+    },
+    {
+      "input": "How should I handle a 500 error from an API?",
+      "expected": {"contains": "backoff"}
+    },
+    {
+      "input": "Write error handling for a requests.get call",
+      "expected": {"contains": "except"}
+    }
+  ]
+}
 ```
 """
 
@@ -71,68 +73,16 @@ TEST_GENERATION_PROMPT = (
     "## Your Task\n\n"
     f"Task: {TASK_PLACEHOLDER}\n\n"
     "Generate test cases that verify the agent can apply the skill correctly.\n\n"
-    "Output ONLY valid JSON array (no markdown code blocks):\n"
-    "[\n"
-    '  {"input": "prompt/question for the agent",\n'
-    '   "expected": {"contains": "substring that should appear in good response"}}\n'
-    "]\n\n"
+    "Output ONLY a valid JSON object (no markdown code blocks):\n"
+    "{\n"
+    '  "cases": [\n'
+    '    {"input": "prompt/question for the agent",\n'
+    '     "expected": {"contains": "substring that should appear in good response"}}\n'
+    "  ]\n"
+    "}\n\n"
     "Focus on practical scenarios that test understanding of the core concepts."
 )
 
-
-
-def parse_json_response(content: str) -> dict:
-    """Parse JSON from model response, handling common issues."""
-    content = content.strip()
-
-    # Remove outer markdown code block if present
-    if content.startswith("```json"):
-        content = content[7:]
-        if content.rstrip().endswith("```"):
-            content = content.rstrip()[:-3]
-    elif content.startswith("```"):
-        content = content[3:]
-        if content.rstrip().endswith("```"):
-            content = content.rstrip()[:-3]
-
-    content = content.strip()
-
-    # Try direct parse first
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        pass
-
-    # Try to fix common issues: unescaped newlines in strings
-    try:
-        fixed = re.sub(
-            r'(?<=": ")(.*?)(?="[,\}])',
-            lambda m: m.group(0).replace("\n", "\\n").replace("\t", "\\t"),
-            content,
-            flags=re.DOTALL,
-        )
-        return json.loads(fixed)
-    except (json.JSONDecodeError, re.error):
-        pass
-
-    # Last resort: try to extract partial JSON
-    try:
-        start = content.find("{")
-        if start >= 0:
-            for end in range(len(content), start + 2, -1):
-                try:
-                    substr = content[start:end]
-                    open_braces = substr.count("{") - substr.count("}")
-                    substr += "}" * open_braces
-                    result = json.loads(substr)
-                    if isinstance(result, dict) and len(result) > 0:
-                        return result
-                except json.JSONDecodeError:
-                    continue
-    except Exception:
-        pass
-
-    raise ValueError(f"Could not parse JSON from response:\n{content[:500]}...")
 
 
 def build_skill_generator(config_path: Path, model: str | None = None) -> FastAgent:
@@ -174,65 +124,30 @@ async def generate_skill(
 
     fast = build_skill_generator(config_path, model)
 
-    last_error = None
-    data: dict[str, object] | None = None
-    response = ""
+    last_error: Exception | None = None
+    result: SkillDraft | None = None
     for attempt in range(2):
         async with fast.run() as agent:
-            response = await agent.skill_gen.send(prompt)
+            result, _ = await agent.skill_gen.structured(prompt, SkillDraft)
 
-        try:
-            data = parse_json_response(response)
-        except ValueError as e:
-            last_error = e
-            if attempt == 0:
-                prompt = (
-                    f"{prompt}\n\nIMPORTANT: Output only raw JSON, no code blocks."
-                )
-                continue
-            raise last_error
+        if result is not None:
+            break
 
-        required = ["name", "description", "body"]
-        missing = [k for k in required if k not in data]
-        if missing:
-            if attempt == 0:
-                prompt = (
-                    f"{prompt}\n\nIMPORTANT: Include all required fields: name, description, body."
-                )
-                continue
-            preview = {
-                k: (v[:100] + "..." if isinstance(v, str) and len(v) > 100 else v)
-                for k, v in data.items()
-            }
-            raise ValueError(
-                "Missing required fields: "
-                f"{missing}\nGot: {preview}\n\nRaw response:\n"
-                f"{response[:1000]}"
-            )
-        break
+        last_error = ValueError("Skill generator did not return structured output.")
+        if attempt == 0:
+            prompt = f"{prompt}\n\nIMPORTANT: Follow the structured schema exactly."
+            continue
+        raise last_error
 
-    if data is None:
+    if result is None:
         raise ValueError("No data returned from skill generator")
 
-    name = data.get("name")
-    description = data.get("description")
-    body = data.get("body")
-    if not isinstance(name, str) or not isinstance(description, str) or not isinstance(body, str):
-        preview = {
-            k: (v[:100] + "..." if isinstance(v, str) and len(v) > 100 else v)
-            for k, v in data.items()
-        }
-        raise ValueError(
-            "Skill response contained non-string required fields."
-            f"\nGot: {preview}\n\nRaw response:\n{response[:1000]}"
-        )
-
     return Skill(
-        name=name,
-        description=description,
-        body=body,
-        references=data.get("references", {}),
-        scripts=data.get("scripts", {}),
+        name=result.name,
+        description=result.description,
+        body=result.body,
+        references=result.references or {},
+        scripts=result.scripts or {},
         metadata=SkillMetadata(
             generated_by=model,
             generated_at=datetime.now(UTC),
@@ -254,13 +169,12 @@ async def generate_tests(
     fast = build_test_generator(config_path, model)
 
     async with fast.run() as agent:
-        response = await agent.test_gen.send(prompt)
+        result, _ = await agent.test_gen.structured(prompt, TestCaseSuite)
 
-    data = parse_json_response(response)
+    if result is None:
+        raise ValueError("Test generator did not return structured test cases.")
 
-    if isinstance(data, list):
-        return [TestCase(**tc) for tc in data]
-    return [TestCase(**tc) for tc in data.get("cases", data)]
+    return result.cases
 
 
 async def refine_skill(
@@ -288,16 +202,17 @@ Output improved skill as JSON (same structure, no code blocks)."""
     fast = build_skill_generator(config_path, model)
 
     async with fast.run() as agent:
-        response = await agent.skill_gen.send(prompt)
+        result, _ = await agent.skill_gen.structured(prompt, SkillDraft)
 
-    data = parse_json_response(response)
+    if result is None:
+        raise ValueError("Skill refinement did not return structured output.")
 
     return Skill(
-        name=data.get("name", skill.name),
-        description=data.get("description", skill.description),
-        body=data["body"],
-        references=data.get("references", skill.references),
-        scripts=data.get("scripts", skill.scripts),
+        name=result.name or skill.name,
+        description=result.description or skill.description,
+        body=result.body,
+        references=result.references if result.references is not None else skill.references,
+        scripts=result.scripts if result.scripts is not None else skill.scripts,
         metadata=SkillMetadata(
             generated_by=model,
             generated_at=datetime.now(UTC),
@@ -371,19 +286,21 @@ async def improve_skill(
     fast = build_skill_generator(config_path, model)
 
     async with fast.run() as agent:
-        response = await agent.skill_gen.send(prompt)
+        result, _ = await agent.skill_gen.structured(prompt, SkillDraft)
 
-    data = parse_json_response(response)
+    if result is None:
+        raise ValueError("Skill improvement did not return structured output.")
 
     return Skill(
-        name=data.get("name", skill.name),
-        description=data.get("description", skill.description),
-        body=data["body"],
-        references=data.get("references", skill.references),
-        scripts=data.get("scripts", skill.scripts),
+        name=result.name or skill.name,
+        description=result.description or skill.description,
+        body=result.body,
+        references=result.references if result.references is not None else skill.references,
+        scripts=result.scripts if result.scripts is not None else skill.scripts,
         metadata=SkillMetadata(
             generated_by=model,
             generated_at=datetime.now(UTC),
             source_task=f"Improved from {skill.name}: {instructions}",
         ),
     )
+
