@@ -1,26 +1,45 @@
 <img width="1920" height="1080" alt="upskill_banner" src="https://github.com/user-attachments/assets/b71fd417-7d23-4f5d-aa89-06ea6b284d1b" />
 
-# upskill
+# UPskill
 
-Generate and evaluate agent skills using FastAgent. Create instruction documents that teach AI coding agents how to perform tasks reliably.
-
-## Installation
-
-```bash
-pip install upskill
-# or
-uvx upskill
-```
+Generate and evaluate agent skills based on traces with agents. Create skills with teacher models (expensive/slow) that student models (cheap/fast) can use to perform harder tasks reliably.
 
 ## Quick Start
 
-```bash
-# Generate a skill from <img width="1920" height="1080" alt="upskill_banner" src="https://github.com/user-attachments/assets/4c667844-b1f1-4ee6-aee9-a6abe557fc6c" />
-a task description
-upskill generate "write good git commit messages"
+Install upskill:
 
+```bash
+pip install upskill
+# or just use uv
+uvx upskill
+```
+
+Create a new skill
+
+```bash
+upskill generate "write good git commit messages"
+# or based on previous agent traces
+upskill generate "document the pattern" --from ./trace.md
 # Skills are saved to ./skills/{skill-name}/ by default
-# Run logs are saved to ./runs/ by default
+```
+
+Generate a skill with a teaching model and evaluate it on a student model.
+
+```bash
+upskill generate "write good git commit messages" --model sonnet --eval-model haiku
+```
+
+Benchmark a set of models against a skill.
+
+```bash
+upskill eval ./skills/git-commit-messages/ -m haiku -m sonnet
+# logs pretty printed to the terminal
+```
+
+View the results later.
+
+```bash
+upskill runs --skill git-commit-messages
 ```
 
 ## Commands
@@ -39,12 +58,12 @@ upskill generate TASK [OPTIONS]
 **Options:**
 - `-e, --example` - Input -> output example (can be repeated)
 - `--tool` - Generate from MCP tool schema (path#tool_name)
-- `--trace PATH` - Generate from agent trace file
+- `-f, --from PATH` - Improve from existing skill dir or agent trace file (auto-detected)
 - `-m, --model MODEL` - Model for generation (e.g., 'sonnet', 'haiku', 'anthropic.claude-sonnet-4-20250514')
 - `-o, --output PATH` - Output directory for skill
 - `--no-eval` - Skip evaluation and refinement
 - `--eval-model MODEL` - Different model to evaluate skill on
-- `--eval-provider [anthropic|openai|generic]` - API provider for eval model (auto-detected as 'generic' when --eval-base-url is provided)
+- `--eval-provider [anthropic|openai|generic]` - API provider for eval model
 - `--eval-base-url URL` - Custom API endpoint for eval model
 - `--runs-dir PATH` - Directory for run logs (default: ./runs)
 - `--log-runs / --no-log-runs` - Log run data (default: enabled)
@@ -55,17 +74,19 @@ upskill generate TASK [OPTIONS]
 # Basic usage
 upskill generate "parse JSON Schema files"
 
-# Generate a skill based on a trace file
-upskill generate "parse JSON Schema files" --trace ./conversation_with_claude_sonnet.md
-
 # Make and evaluate skills for less powerful models
 upskill generate "write git commits" --model sonnet --eval-model haiku
+
+# Improve an existing skill (auto-detected as directory)
+upskill generate "add more error handling examples" --from ./skills/api-errors/
+
+# Generate from an agent trace file (auto-detected as file)
+upskill generate "document the pattern" --from ./trace.json
 
 # Evaluate on local model (llama.cpp server)
 upskill generate "parse YAML" \
     --eval-model "unsloth/GLM-4.7-Flash-GGUF:Q4_0" \
     --eval-base-url http://localhost:8080/v1
-
 ```
 
 **Output:**
@@ -91,7 +112,7 @@ Saved to ./skills/git-commit-messages
 
 ### `upskill eval`
 
-Evaluate an existing skill against test cases.
+Evaluate an existing skill against test cases. Supports single-model evaluation with baseline comparison, or multi-model benchmarking.
 
 ```bash
 upskill eval SKILL_PATH [OPTIONS]
@@ -102,7 +123,8 @@ upskill eval SKILL_PATH [OPTIONS]
 
 **Options:**
 - `-t, --tests PATH` - Test cases JSON file
-- `-m, --model MODEL` - Model to evaluate against
+- `-m, --model MODEL` - Model(s) to evaluate against (repeatable for multi-model benchmarking)
+- `--runs N` - Number of runs per model (default: 1)
 - `--provider [anthropic|openai|generic]` - API provider (auto-detected as 'generic' when --base-url is provided)
 - `--base-url URL` - Custom API endpoint for local models
 - `--no-baseline` - Skip baseline comparison
@@ -113,7 +135,7 @@ upskill eval SKILL_PATH [OPTIONS]
 **Examples:**
 
 ```bash
-# Basic evaluation
+# Basic evaluation with baseline comparison
 upskill eval ./skills/my-skill/
 
 # With verbose output
@@ -125,9 +147,15 @@ upskill eval ./skills/my-skill/ --tests ./tests.json
 # Evaluate on specific model
 upskill eval ./skills/my-skill/ -m haiku
 
+# Multi-model benchmarking (compare models)
+upskill eval ./skills/my-skill/ -m haiku -m sonnet
+
+# Multiple runs per model for statistical significance
+upskill eval ./skills/my-skill/ -m haiku -m sonnet --runs 5
+
 # Evaluate on local model (llama.cpp server)
 upskill eval ./skills/my-skill/ \
-    --model "unsloth/GLM-4.7-Flash-GGUF:Q4_0" \
+    -m "unsloth/GLM-4.7-Flash-GGUF:Q4_0" \
     --base-url http://localhost:8080/v1
 
 # Skip baseline (just test with skill)
@@ -135,6 +163,26 @@ upskill eval ./skills/my-skill/ --no-baseline
 
 # Disable run logging
 upskill eval ./skills/my-skill/ --no-log-runs
+```
+
+**Benchmark output:**
+
+```
+Evaluating my-skill across 2 model(s)
+  3 test case(s), 5 run(s) per model
+
+haiku
+  Pass rate: 4/5 (80%)  Avg assertions: 2.8/3
+
+sonnet
+  Pass rate: 5/5 (100%)  Avg assertions: 3.0/3
+
+┏━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┓
+┃ Model  ┃ Pass Rate ┃ Avg Assertions ┃ Avg Tokens ┃
+┡━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━┩
+│ haiku  │ 4/5       │ 2.8/3          │ 1250       │
+│ sonnet │ 5/5       │ 3.0/3          │ 1890       │
+└────────┴───────────┴────────────────┴────────────┘
 ```
 
 **Test cases JSON format:**
@@ -148,7 +196,7 @@ upskill eval ./skills/my-skill/ --no-log-runs
 
 ### `upskill list`
 
-List all generated skills.
+List all generated skills in a tree view.
 
 ```bash
 upskill list [OPTIONS]
@@ -156,6 +204,7 @@ upskill list [OPTIONS]
 
 **Options:**
 - `-d, --dir PATH` - Skills directory to list
+- `-v, --verbose` - Show skill contents preview
 
 **Examples:**
 
@@ -165,11 +214,34 @@ upskill list
 
 # List from custom directory
 upskill list -d ./my-skills/
+
+# Show preview of skill contents
+upskill list -v
+```
+
+**Output:**
+
+```
+./skills
+├── git-commit-messages
+│   ├── Write clear, conventional commit messages...
+│   └── files
+│       └── SKILL.md
+├── api-error-handling
+│   ├── Handle API errors gracefully with proper logging...
+│   └── files
+│       ├── SKILL.md
+│       └── references/error-codes.md
+└── yaml-parsing
+    ├── Parse YAML files safely with schema validation...
+    └── files
+        ├── SKILL.md
+        └── scripts/validate.py
 ```
 
 ### `upskill runs`
 
-Summarize run logs to CSV.
+View run results as a plot, or export to CSV. By default, shows a visual comparison of baseline vs with-skill performance.
 
 ```bash
 upskill runs [OPTIONS]
@@ -177,19 +249,54 @@ upskill runs [OPTIONS]
 
 **Options:**
 - `-d, --dir PATH` - Runs directory
-- `--csv PATH` - Output CSV path
+- `-s, --skill TEXT` - Filter by skill name(s) (repeatable)
+- `-m, --model TEXT` - Filter by model(s) (repeatable)
+- `--metric [success|tokens]` - Metric to display (default: success)
+- `--csv PATH` - Export to CSV instead of plot
 
 **Examples:**
 
 ```bash
-# Summarize default runs directory
+# View results plot (default)
 upskill runs
+
+# Filter by skill and models
+upskill runs -s my-skill -m haiku -m sonnet
+
+# Show token usage instead of success rate
+upskill runs --metric tokens
+
+# Export to CSV
+upskill runs --csv ./results.csv
 
 # Custom runs directory
 upskill runs -d ./my-runs/
+```
 
-# Custom output path
-upskill runs --csv ./results.csv
+**Plot output:**
+
+```
+skill: git-commit-messages
+
+haiku
+  baseline   ████████████░░░░░░░░   60%
+  with skill ████████████████░░░░   80%  (+20%)
+
+sonnet
+  baseline   ████████████░░░░░░░░   60%
+  with skill ████████████████████  100%  (+40%)
+```
+
+**Matrix view (multiple skills and models):**
+
+```
+┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━┓
+┃ skill               ┃ haiku        ┃ sonnet       ┃
+┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━┩
+│ git-commit-messages │ 60%→80%      │ 60%→100%     │
+│ api-error-handling  │ 40%→70%      │ 50%→90%      │
+│ yaml-parsing        │ 70%→90%      │ 80%→100%     │
+└─────────────────────┴──────────────┴──────────────┘
 ```
 
 ## Skill Output Format
