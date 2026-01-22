@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
 from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -14,18 +12,18 @@ if TYPE_CHECKING:
     from upskill.models import Skill
 
 
-@contextmanager
-def resolve_agent_cards_path() -> Iterator[Path]:
-    """Resolve the packaged AgentCard directory for upskill."""
-    cards = resources.files("upskill").joinpath("agent_cards")
-    with resources.as_file(cards) as path:
-        yield path
-
 def compose_instruction(instruction: str, skill: Skill | None) -> str:
     """Inject the skill content into an instruction when provided."""
     if not skill:
         return instruction
     return f"{instruction}\n\n## Skill: {skill.name}\n\n{skill.body}"
+
+
+def load_upskill_agent_cards(fast: FastAgent) -> list[str]:
+    """Load packaged AgentCards into a FastAgent instance."""
+    cards = resources.files("upskill").joinpath("agent_cards")
+    with resources.as_file(cards) as cards_path:
+        return fast.load_agents(cards_path)
 
 
 def build_agent_from_card(
@@ -48,8 +46,7 @@ def build_agent_from_card(
     if model:
         fast.args.model = model
 
-    with resolve_agent_cards_path() as cards_path:
-        fast.load_agents(cards_path)
+    load_upskill_agent_cards(fast)
 
     agent_data = fast.agents.get(agent_name)
     if not agent_data:
