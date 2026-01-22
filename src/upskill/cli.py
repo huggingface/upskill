@@ -213,10 +213,7 @@ async def _generate_async(
                     batch_id=batch_id or "",
                     run_number=baseline_run_num,
                 ),
-                stats=ConversationStats(
-                    total_tokens=results.baseline_total_tokens,
-                    turns=int(results.baseline_avg_turns * len(test_cases)),
-                ),
+                stats=aggregate_conversation_stats(results.baseline_results),
                 passed=results.baseline_success_rate > 0.5,
                 assertions_passed=int(results.baseline_success_rate * len(test_cases)),
                 assertions_total=len(test_cases),
@@ -235,10 +232,7 @@ async def _generate_async(
                     batch_id=batch_id or "",
                     run_number=attempt * 2 + 2,
                 ),
-                stats=ConversationStats(
-                    total_tokens=results.with_skill_total_tokens,
-                    turns=int(results.with_skill_avg_turns * len(test_cases)),
-                ),
+                stats=aggregate_conversation_stats(results.with_skill_results),
                 passed=results.is_beneficial,
                 assertions_passed=int(results.with_skill_success_rate * len(test_cases)),
                 assertions_total=len(test_cases),
@@ -319,10 +313,7 @@ async def _generate_async(
                     batch_id=batch_id or "",
                     run_number=run_number,
                 ),
-                stats=ConversationStats(
-                    total_tokens=eval_results.baseline_total_tokens,
-                    turns=int(eval_results.baseline_avg_turns * len(test_cases)),
-                ),
+                stats=aggregate_conversation_stats(eval_results.baseline_results),
                 passed=eval_results.baseline_success_rate > 0.5,
                 assertions_passed=int(eval_results.baseline_success_rate * len(test_cases)),
                 assertions_total=len(test_cases),
@@ -341,10 +332,7 @@ async def _generate_async(
                     batch_id=batch_id or "",
                     run_number=run_number + 1,
                 ),
-                stats=ConversationStats(
-                    total_tokens=eval_results.with_skill_total_tokens,
-                    turns=int(eval_results.with_skill_avg_turns * len(test_cases)),
-                ),
+                stats=aggregate_conversation_stats(eval_results.with_skill_results),
                 passed=eval_results.is_beneficial,
                 assertions_passed=int(eval_results.with_skill_success_rate * len(test_cases)),
                 assertions_total=len(test_cases),
@@ -585,10 +573,7 @@ async def _eval_async(
                     batch_id=batch_id or "",
                     run_number=1,
                 ),
-                stats=ConversationStats(
-                    total_tokens=results.baseline_total_tokens,
-                    turns=int(results.baseline_avg_turns * len(test_cases)),
-                ),
+                stats=aggregate_conversation_stats(results.baseline_results),
                 passed=results.baseline_success_rate > 0.5,
                 assertions_passed=int(results.baseline_success_rate * len(test_cases)),
                 assertions_total=len(test_cases),
@@ -608,10 +593,7 @@ async def _eval_async(
                 batch_id=batch_id or "",
                 run_number=2 if not no_baseline else 1,
             ),
-            stats=ConversationStats(
-                total_tokens=results.with_skill_total_tokens,
-                turns=int(results.with_skill_avg_turns * len(test_cases)),
-            ),
+            stats=aggregate_conversation_stats(results.with_skill_results),
             passed=results.is_beneficial
             if not no_baseline
             else results.with_skill_success_rate > 0.5,
@@ -832,6 +814,7 @@ async def _benchmark_async(
             total_tokens = 0
             total_turns = 0
             all_passed = True
+            run_results: list[TestResult] = []
 
             for tc_idx, tc in enumerate(test_cases, 1):
                 if verbose:
@@ -868,8 +851,12 @@ async def _benchmark_async(
                 total_tokens += result.stats.total_tokens
                 total_turns += result.stats.turns
 
+                run_results.append(result)
+
                 if not result.success:
                     all_passed = False
+
+            aggregated_stats = aggregate_conversation_stats(run_results)
 
             # Create run result
             run_result = RunResult(
@@ -879,10 +866,7 @@ async def _benchmark_async(
                     batch_id=batch_id,
                     run_number=run_num,
                 ),
-                stats=ConversationStats(
-                    total_tokens=total_tokens,
-                    turns=total_turns,
-                ),
+                stats=aggregated_stats,
                 passed=all_passed,
                 assertions_passed=total_assertions_passed,
                 assertions_total=total_assertions,

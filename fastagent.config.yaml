@@ -6,7 +6,7 @@
 # Examples: anthropic.claude-sonnet-4-20250514, openai.gpt-4.1
 # Aliases: haiku, sonnet, opus (Anthropic), gpt-4.1, o3-mini (OpenAI)
 # Local models: generic.<model_name> (e.g., generic.llama3.2:latest)
-default_model: sonnet
+default_model: kimi
 
 # Generic provider for local OpenAI-compatible endpoints (Ollama, llama.cpp, etc.)
 # Override with GENERIC_BASE_URL and GENERIC_API_KEY environment variables
@@ -29,18 +29,4 @@ logger:
   show_chat: true
   show_tools: true
   truncate_tools: true
-  streaming: markdown
-
-# MCP Servers (optional - can be enabled for skill testing)
-# mcp:
-#   servers:
-#     fetch:
-#       command: "uvx"
-#       args: ["mcp-server-fetch"]
-#     filesystem:
-#       command: "npx"
-#       args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
-#     huggingface:
-#       url: "https://huggingface.co/mcp?bouquet=skills"
-#       headers:
-#         "Authorization": "Bearer ${HF_TOKEN}"
+  streaming: none

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import tempfile
@@ -27,6 +28,8 @@ from upskill.models import (
     ValidationResult,
 )
 from upskill.validators import get_validator
+
+logger = logging.getLogger(__name__)
 
 PROMPT = (
     "You are an evaluator of skills. You are given a skill and a test case. "
@@ -124,16 +127,16 @@ def build_eval_agent(
     fast = build_agent_from_card(
         "upskill-evaluator",
         config_path,
-        agent_name="default",
+        agent_name="evaluator",
         model=model,
         provider=provider,
         base_url=base_url,
         servers=servers,
     )
 
-    agent_data = fast.agents.get("default")
+    agent_data = fast.agents.get("evaluator")
     if not agent_data:
-        raise ValueError("AgentCard 'default' not found in upskill package")
+        raise ValueError("AgentCard 'evaluator' not found in upskill package")
 
     base_instruction = instruction or agent_data.get("instruction") or PROMPT
     agent_data["instruction"] = compose_instruction(base_instruction, skill)
@@ -177,15 +180,15 @@ async def run_test(
             stats = ConversationStats()
 
             async with fast.run() as agent:
-                output = await agent.default.send(user_content)
+                output = await agent.evaluator.send(user_content)
 
                 # Extract stats from agent history
                 try:
-                    history = agent.default.history()
-                    summary = ConversationSummary(history)
+                    history = agent.evaluator.message_history
+                    summary = ConversationSummary(messages=history)
                     stats = extract_stats_from_summary(summary)
-                except Exception:
-                    pass  # Stats extraction may fail for some agent types
+                except Exception as exc:
+                    logger.exception("Failed to extract stats from evaluator history", exc_info=exc)
 
             # Check expected with custom validator support
             if workspace and test_case.validator:

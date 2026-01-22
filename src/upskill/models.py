@@ -255,6 +255,9 @@ class ConversationStats(BaseModel):
     output_tokens: int = 0
     total_tokens: int = 0
 
+    # Raw usage summaries (normalized by fast-agent)
+    usage_summaries: list[dict[str, object]] = Field(default_factory=list)
+
     # Legacy field for backwards compatibility
     @property
     def tokens(self) -> int:

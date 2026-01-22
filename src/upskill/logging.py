@@ -8,8 +8,10 @@ from datetime import datetime
 from pathlib import Path
 
 from fast_agent import ConversationSummary
+from fast_agent.constants import FAST_AGENT_USAGE
+from fast_agent.mcp.helpers.content_helpers import get_text
 
-from upskill.models import BatchSummary, ConversationStats, RunMetadata, RunResult
+from upskill.models import BatchSummary, ConversationStats, RunMetadata, RunResult, TestResult
 
 # CSV field names for run summaries (matching skills-test format)
 FIELDNAMES = [
@@ -105,34 +107,83 @@ def load_run_result(run_folder: Path) -> RunResult | None:
         return None
 
 
-def extract_tokens_from_messages(messages: list) -> tuple[int, int]:
+def extract_tokens_from_messages(
+    messages: list,
+) -> tuple[int, int, int, list[dict[str, object]]]:
     """Extract token counts from message channels.
 
-    FastAgent stores usage data in the FAST_AGENT_USAGE channel as JSON.
+    FastAgent stores usage data in the fast-agent usage channel as JSON.
     """
     input_tokens = 0
     output_tokens = 0
+    total_tokens = 0
+    usage_summaries: list[dict[str, object]] = []
+    debug_usage_blocks: list[object] = []
+    debug_printed = False
 
     for msg in messages:
         channels = getattr(msg, "channels", None)
         if not channels:
             continue
 
-        # Look for usage channel (FAST_AGENT_USAGE)
-        usage_content = channels.get("FAST_AGENT_USAGE", [])
+        # Look for usage channel (fast-agent-usage)
+        usage_content = channels.get(FAST_AGENT_USAGE, [])
+        if usage_content and not debug_usage_blocks:
+            debug_usage_blocks = list(usage_content)
         for content in usage_content:
-            # Content is TextContent with text field containing JSON
-            text = getattr(content, "text", None)
+            # Content may be TextContent or a serialized dict
+            if isinstance(content, dict):
+                text = content.get("text")
+            else:
+                text = get_text(content) or getattr(content, "text", None)
             if not text:
                 continue
             try:
                 usage_data = json.loads(text)
-                input_tokens += usage_data.get("input_tokens", 0)
-                output_tokens += usage_data.get("output_tokens", 0)
             except (json.JSONDecodeError, TypeError):
                 continue
 
-    return input_tokens, output_tokens
+            if not isinstance(usage_data, dict):
+                continue
+
+            turn_data = usage_data.get("turn")
+            summary_data = usage_data.get("summary")
+            if debug_usage_blocks and not debug_printed:
+                print("--------------")
+                print(debug_usage_blocks)
+                print("PARSED:", usage_data)
+                print("TURN:", turn_data)
+                print("SUMMARY:", summary_data)
+                print("****************")
+                debug_printed = True
+
+            if isinstance(turn_data, dict):
+                input_tokens += int(turn_data.get("input_tokens", 0) or 0)
+                output_tokens += int(turn_data.get("output_tokens", 0) or 0)
+                total_tokens += int(turn_data.get("total_tokens", 0) or 0)
+                if isinstance(summary_data, dict):
+                    usage_summaries.append(summary_data)
+                continue
+
+            if isinstance(summary_data, dict):
+                usage_summaries.append(summary_data)
+                input_tokens = max(
+                    input_tokens,
+                    int(summary_data.get("cumulative_input_tokens", 0) or 0),
+                )
+                output_tokens = max(
+                    output_tokens,
+                    int(summary_data.get("cumulative_output_tokens", 0) or 0),
+                )
+                total_tokens = max(
+                    total_tokens,
+                    int(summary_data.get("cumulative_billing_tokens", 0) or 0),
+                )
+
+    if total_tokens == 0:
+        total_tokens = input_tokens + output_tokens
+
+    return input_tokens, output_tokens, total_tokens, usage_summaries
 
 
 def extract_stats_from_summary(summary: ConversationSummary) -> ConversationStats:
@@ -160,8 +211,9 @@ def extract_stats_from_summary(summary: ConversationSummary) -> ConversationStat
     execute_calls = sum(count for name, count in tool_call_map.items() if "__" not in name)
 
     # Extract token metrics from message channels
-    input_tokens, output_tokens = extract_tokens_from_messages(summary.messages)
-    total_tokens = input_tokens + output_tokens
+    input_tokens, output_tokens, total_tokens, usage_summaries = extract_tokens_from_messages(
+        summary.messages
+    )
 
     return ConversationStats(
         conversation_span_ms=conversation_span_ms,
@@ -177,7 +229,36 @@ def extract_stats_from_summary(summary: ConversationSummary) -> ConversationStat
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,
+        usage_summaries=usage_summaries,
     )
+
+
+
+
+def aggregate_conversation_stats(results: list[TestResult]) -> ConversationStats:
+    """Aggregate ConversationStats across multiple test results."""
+    aggregate = ConversationStats()
+    for result in results:
+        stats = result.stats
+        aggregate.conversation_span_ms += stats.conversation_span_ms
+        aggregate.llm_time_ms += stats.llm_time_ms
+        aggregate.tool_time_ms += stats.tool_time_ms
+        aggregate.turns += stats.turns
+        aggregate.tool_calls += stats.tool_calls
+        aggregate.tool_errors += stats.tool_errors
+        aggregate.mcp_calls += stats.mcp_calls
+        aggregate.execute_calls += stats.execute_calls
+        aggregate.input_tokens += stats.input_tokens
+        aggregate.output_tokens += stats.output_tokens
+        aggregate.total_tokens += stats.total_tokens
+        aggregate.usage_summaries.extend(stats.usage_summaries)
+        for name, count in stats.tool_call_map.items():
+            aggregate.tool_call_map[name] = aggregate.tool_call_map.get(name, 0) + count
+        for name, count in stats.tool_error_map.items():
+            aggregate.tool_error_map[name] = aggregate.tool_error_map.get(name, 0) + count
+    if aggregate.total_tokens == 0:
+        aggregate.total_tokens = aggregate.input_tokens + aggregate.output_tokens
+    return aggregate
 
 
 def summarize_conversation_stats(history_path: Path | None) -> ConversationStats:

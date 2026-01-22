@@ -175,38 +175,62 @@ async def generate_skill(
     fast = build_skill_generator(config_path, model)
 
     last_error = None
+    data: dict[str, object] | None = None
+    response = ""
     for attempt in range(2):
         async with fast.run() as agent:
             response = await agent.skill_gen.send(prompt)
 
         try:
             data = parse_json_response(response)
-            break
         except ValueError as e:
             last_error = e
             if attempt == 0:
-                prompt = f"{prompt}\n\nIMPORTANT: Output only raw JSON, no code blocks."
+                prompt = (
+                    f"{prompt}\n\nIMPORTANT: Output only raw JSON, no code blocks."
+                )
                 continue
             raise last_error
 
-    # Validate required fields
-    required = ["name", "description", "body"]
-    missing = [k for k in required if k not in data]
-    if missing:
+        required = ["name", "description", "body"]
+        missing = [k for k in required if k not in data]
+        if missing:
+            if attempt == 0:
+                prompt = (
+                    f"{prompt}\n\nIMPORTANT: Include all required fields: name, description, body."
+                )
+                continue
+            preview = {
+                k: (v[:100] + "..." if isinstance(v, str) and len(v) > 100 else v)
+                for k, v in data.items()
+            }
+            raise ValueError(
+                "Missing required fields: "
+                f"{missing}\nGot: {preview}\n\nRaw response:\n"
+                f"{response[:1000]}"
+            )
+        break
+
+    if data is None:
+        raise ValueError("No data returned from skill generator")
+
+    name = data.get("name")
+    description = data.get("description")
+    body = data.get("body")
+    if not isinstance(name, str) or not isinstance(description, str) or not isinstance(body, str):
         preview = {
             k: (v[:100] + "..." if isinstance(v, str) and len(v) > 100 else v)
             for k, v in data.items()
         }
         raise ValueError(
-            "Missing required fields: "
-            f"{missing}\nGot: {preview}\n\nRaw response:\n"
-            f"{response[:1000]}"
+            "Skill response contained non-string required fields."
+            f"\nGot: {preview}\n\nRaw response:\n{response[:1000]}"
         )
 
     return Skill(
-        name=data["name"],
-        description=data["description"],
-        body=data["body"],
+        name=name,
+        description=description,
+        body=body,
         references=data.get("references", {}),
         scripts=data.get("scripts", {}),
         metadata=SkillMetadata(

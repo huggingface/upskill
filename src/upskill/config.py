@@ -52,7 +52,7 @@ class Config(BaseModel):
 
     # Generation settings
     auto_eval: bool = Field(default=True, description="Run eval after generation")
-    max_refine_attempts: int = Field(default=3, description="Max refinement iterations")
+    max_refine_attempts: int = Field(default=2, description="Max refinement iterations")
 
     # FastAgent settings
     fastagent_config: Path | None = Field(default=None, description="Path to fastagent.config.yaml")
