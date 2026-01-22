@@ -1,6 +1,5 @@
 ---
 type: agent
-name: skill_gen
 description: Generate skill documents from task descriptions.
 ---
 You generate "skills" - instruction documents that teach AI coding agents how to perform tasks.
