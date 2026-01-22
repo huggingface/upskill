@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 
 from fast_agent.interfaces import AgentProtocol
 
+from upskill.manifest_utils import parse_skill_manifest_text
 from upskill.models import Skill, SkillDraft, SkillMetadata, TestCase, TestCaseSuite
 
 # Few-shot examples for test generation
@@ -99,29 +100,18 @@ async def generate_skill(
         )
 
 
-    last_error: Exception | None = None
     result: SkillDraft | None = None
-    for attempt in range(2):
-        result, _ = await generator.structured(prompt, SkillDraft)
 
-        if result is not None:
-            break
-
-        last_error = ValueError("Skill generator did not return structured output.")
-        if attempt == 0:
-            prompt = f"{prompt}\n\nIMPORTANT: Follow the structured schema exactly."
-            continue
-        raise last_error
-
-    if result is None:
-        raise ValueError("No data returned from skill generator")
+    result, _ = await generator.structured(prompt, SkillDraft)
+    skill = await generator.send(prompt)
+    manifest, _  = parse_skill_manifest_text(skill)    
 
     return Skill(
-        name=result.name,
-        description=result.description,
-        body=result.body,
-        references=result.references or {},
-        scripts=result.scripts or {},
+        name=manifest.name,
+        description=manifest.description,
+        body=manifest.body,
+        references= {},
+        scripts= {},
         metadata=SkillMetadata(
             generated_by=model,
             generated_at=datetime.now(UTC),
