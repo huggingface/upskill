@@ -11,7 +11,10 @@ import click
 from dotenv import load_dotenv
 from fast_agent import FastAgent
 from rich.console import Console
+from rich.panel import Panel
+from rich.syntax import Syntax
 from rich.table import Table
+from rich.tree import Tree
 
 from upskill.config import Config
 from upskill.evaluate import evaluate_skill, get_failure_descriptions
@@ -49,13 +52,12 @@ def main():
 @click.argument("task")
 @click.option("-e", "--example", multiple=True, help="Input -> output example")
 @click.option("--tool", help="Generate from MCP tool schema (path#tool_name)")
-@click.option("--trace", type=click.Path(exists=True), help="Generate from agent trace")
 @click.option(
     "-f",
     "--from",
-    "from_skill",
+    "from_path",
     type=click.Path(exists=True),
-    help="Existing skill to improve (path to skill directory)",
+    help="Improve from existing skill dir or agent trace file (auto-detected)",
 )
 @click.option(
     "-m",
@@ -82,8 +84,7 @@ def generate(
     task: str,
     example: tuple[str, ...],
     tool: str | None,  # noqa: ARG001
-    trace: str | None,  # noqa: ARG001
-    from_skill: str | None,
+    from_path: str | None,
     model: str | None,
     output: str | None,
     no_eval: bool,
@@ -95,6 +96,9 @@ def generate(
 ):
     """Generate a skill from a task description, or improve an existing skill.
 
+    The --from option auto-detects whether the path is a skill directory
+    (contains SKILL.md) or an agent trace file.
+
     Examples:
 
         upskill generate "parse JSON Schema files"
@@ -105,11 +109,15 @@ def generate(
 
         upskill generate "validate forms" -o ./my-skills/validation
 
-        # Improve an existing skill:
+        # Improve an existing skill (auto-detected as directory):
 
         upskill generate "add more error handling examples" --from ./skills/api-errors/
 
         upskill generate "make it more concise" -f ./skills/my-skill/ -o ./skills/my-skill-v2/
+
+        # Generate from agent trace (auto-detected as file):
+
+        upskill generate "document the pattern" --from ./trace.json
 
         # Evaluate on a local model (Ollama):
 
@@ -118,11 +126,25 @@ def generate(
 
         upskill generate "document code" --no-log-runs
     """
+    # Auto-detect whether from_path is a skill directory or trace file
+    from_skill = None
+    from_trace = None
+    if from_path:
+        path = Path(from_path)
+        if path.is_dir() and (path / "SKILL.md").exists():
+            from_skill = from_path
+        elif path.is_file():
+            from_trace = from_path
+        elif path.is_dir():
+            console.print(f"[red]Directory {path} does not contain SKILL.md[/red]")
+            sys.exit(1)
+
     asyncio.run(
         _generate_async(
             task,
             list(example) if example else None,
             from_skill,
+            from_trace,
             model,
             output,
             no_eval,
@@ -139,6 +161,7 @@ async def _generate_async(
     task: str,
     examples: list[str] | None,
     from_skill: str | None,
+    from_trace: str | None,
     model: str | None,
     output: str | None,
     no_eval: bool,
@@ -162,25 +185,14 @@ async def _generate_async(
         batch_id, batch_folder = create_batch_folder(runs_path)
         console.print(f"Logging runs to: {batch_folder}", style="dim")
 
-
-    # todo -- legacy in f-a.
-
-    
-#    agents = build_fast_agent()
     fast = FastAgent(
         "upskill",
         ignore_unknown_args=True,
-        ## NB - at the moment we let fast-agent see CLI arguments, check for conflicts/consistency/behaviour required
-#        parse_cli_args=False,        
-#        config_path=str(CONFIG_PATH),
-#        environment_dir=environment_dir,
-#        skills_directory=[skills_manifest_dir],
     )
 
     @fast.agent()
     async def empty():
         pass
-        
 
     # load agents from card files
     cards = resources.files("upskill").joinpath("agent_cards")
@@ -189,18 +201,40 @@ async def _generate_async(
 
     async with fast.run() as agent:
 
-        # Either improve existing skill or generate new one
+        # Improve existing skill, generate from trace, or generate new
         if from_skill:
             existing_skill = Skill.load(Path(from_skill))
             console.print(
                 f"Improving [bold]{existing_skill.name}[/bold] with {gen_model}...",
                 style="dim",
             )
-            skill = await improve_skill(existing_skill, instructions=task, generator=agent.skill_gen, model=model)
+            skill = await improve_skill(
+                existing_skill,
+                instructions=task,
+                generator=agent.skill_gen,
+                model=model,
+            )
+        elif from_trace:
+            console.print(f"Generating skill from trace with {gen_model}...", style="dim")
+            # Load trace file and extract relevant context
+            with open(from_trace, encoding="utf-8") as f:
+                trace_data = json.load(f)
+            # Include trace content as an example for generation
+            trace_context = json.dumps(trace_data, indent=2)[:5000]  # Limit size
+            skill = await generate_skill(
+                task=task,
+                examples=[f"Agent trace:\n{trace_context}"] if not examples else examples,
+                generator=agent.skill_gen,
+                model=model,
+            )
         else:
             console.print(f"Generating skill with {gen_model}...", style="dim")
-            print(agent._agents)
-            skill = await generate_skill(task=task, examples=examples, generator=agent.skill_gen, model=model)
+            skill = await generate_skill(
+                task=task,
+                examples=examples,
+                generator=agent.skill_gen,
+                model=model,
+            )
         if no_eval:
             _save_and_display(skill, output, config)
             return
@@ -480,7 +514,16 @@ def _save_and_display(
 @main.command("eval")
 @click.argument("skill_path", type=click.Path(exists=True))
 @click.option("-t", "--tests", type=click.Path(exists=True), help="Test cases JSON file")
-@click.option("-m", "--model", help="Model to evaluate against (e.g., 'sonnet', 'llama3.2:latest')")
+@click.option(
+    "-m",
+    "--model",
+    "models",
+    multiple=True,
+    help="Model(s) to evaluate against (repeatable for multi-model benchmarking)",
+)
+@click.option(
+    "--runs", "num_runs", type=int, default=1, help="Number of runs per model (default: 1)"
+)
 @click.option(
     "--provider",
     type=click.Choice(["anthropic", "openai", "generic"]),
@@ -496,7 +539,8 @@ def _save_and_display(
 def eval_cmd(
     skill_path: str,
     tests: str | None,
-    model: str | None,
+    models: tuple[str, ...],
+    num_runs: int,
     provider: str | None,
     base_url: str | None,
     no_baseline: bool,
@@ -504,7 +548,10 @@ def eval_cmd(
     log_runs: bool,
     runs_dir: str | None,
 ):
-    """Evaluate a skill (compares with vs without).
+    """Evaluate a skill against test cases.
+
+    Supports single-model evaluation with baseline comparison, or multi-model
+    benchmarking with multiple runs per model.
 
     Examples:
 
@@ -514,10 +561,13 @@ def eval_cmd(
 
         upskill eval ./skills/my-skill/ -m haiku
 
-        # Local model with llama.cpp server:
+        # Multiple models (benchmark mode):
 
-        upskill eval ./skills/my-skill/ -m my-model \\
-            --base-url http://localhost:8080/v1
+        upskill eval ./skills/my-skill/ -m haiku -m sonnet
+
+        # Multiple runs per model:
+
+        upskill eval ./skills/my-skill/ -m haiku -m sonnet --runs 5
 
         # Local model with Ollama:
 
@@ -528,7 +578,16 @@ def eval_cmd(
     """
     asyncio.run(
         _eval_async(
-            skill_path, tests, model, provider, base_url, no_baseline, verbose, log_runs, runs_dir
+            skill_path,
+            tests,
+            list(models) if models else None,
+            num_runs,
+            provider,
+            base_url,
+            no_baseline,
+            verbose,
+            log_runs,
+            runs_dir,
         )
     )
 
@@ -536,7 +595,8 @@ def eval_cmd(
 async def _eval_async(
     skill_path: str,
     tests: str | None,
-    model: str | None,
+    models: list[str] | None,
+    num_runs: int,
     provider: str | None,
     base_url: str | None,
     no_baseline: bool,
@@ -544,7 +604,14 @@ async def _eval_async(
     log_runs: bool,
     runs_dir: str | None,
 ):
-    """Async implementation of eval command."""
+    """Async implementation of eval command.
+
+    Supports two modes:
+    - Single-model eval: standard baseline vs with-skill comparison
+    - Benchmark mode: multiple models and/or multiple runs per model
+    """
+    from upskill.evaluate import run_test
+
     config = Config.load()
     skill_dir = Path(skill_path)
 
@@ -567,10 +634,14 @@ async def _eval_async(
     with resources.as_file(cards) as cards_path:
         fast.load_agents(cards_path)
 
-    results = None
+    # Determine if this is benchmark mode or single-model eval mode
+    model_list = models if models else [config.effective_eval_model]
+    is_benchmark_mode = len(model_list) > 1 or num_runs > 1
+
     test_cases: list[TestCase] = []
 
     async with fast.run() as agent:
+        # Load or generate test cases
         if tests:
             with open(tests, encoding="utf-8") as f:
                 data = json.load(f)
@@ -578,12 +649,14 @@ async def _eval_async(
                 test_cases = [TestCase(**tc) for tc in data["cases"]]
             else:
                 test_cases = [TestCase(**tc) for tc in data]
+        elif skill.tests:
+            test_cases = skill.tests
         else:
             console.print("Generating test cases from skill...", style="dim")
             test_cases = await generate_tests(
                 skill.description,
                 generator=agent.test_gen,
-                model=model,
+                model=model_list[0] if model_list else None,
             )
 
         # Setup run logging
@@ -599,283 +672,219 @@ async def _eval_async(
             provider_info += f" via {provider}"
         if base_url:
             provider_info += f" @ {base_url}"
-        console.print(f"Running {len(test_cases)} test cases{provider_info}...", style="dim")
 
-        results = await evaluate_skill(
-            skill,
-            test_cases,
-            evaluator=agent.evaluator,
-            model=model,
-            run_baseline=not no_baseline,
-        )
+        if is_benchmark_mode:
+            # Multi-model benchmark mode
+            await _run_benchmark_mode(
+                skill,
+                test_cases,
+                model_list,
+                num_runs,
+                fast,
+                config,
+                batch_id,
+                batch_folder,
+                log_runs,
+                verbose,
+                provider_info,
+            )
+        else:
+            # Single-model eval mode with baseline comparison
+            model = model_list[0]
+            console.print(
+                f"Running {len(test_cases)} test cases{provider_info}...", style="dim"
+            )
 
-        # Log results (both baseline and with-skill for plot command)
-        run_results: list[RunResult] = []
-        eval_model = model or config.effective_eval_model
-        if log_runs and batch_folder:
-            # Log baseline result
-            if not no_baseline:
-                baseline_folder = create_run_folder(batch_folder, 1)
-                baseline_result = RunResult(
+            results = await evaluate_skill(
+                skill,
+                test_cases,
+                evaluator=agent.evaluator,
+                model=model,
+                run_baseline=not no_baseline,
+            )
+
+            # Log results (both baseline and with-skill)
+            run_results: list[RunResult] = []
+            if log_runs and batch_folder:
+                # Log baseline result
+                if not no_baseline:
+                    baseline_folder = create_run_folder(batch_folder, 1)
+                    baseline_result = RunResult(
+                        metadata=RunMetadata(
+                            model=model,
+                            task=skill.description,
+                            batch_id=batch_id or "",
+                            run_number=1,
+                        ),
+                        stats=aggregate_conversation_stats(results.baseline_results),
+                        passed=results.baseline_success_rate > 0.5,
+                        assertions_passed=int(
+                            results.baseline_success_rate * len(test_cases)
+                        ),
+                        assertions_total=len(test_cases),
+                        run_type="baseline",
+                        skill_name=skill.name,
+                    )
+                    write_run_metadata(baseline_folder, baseline_result.metadata)
+                    write_run_result(baseline_folder, baseline_result)
+                    run_results.append(baseline_result)
+
+                # Log with-skill result
+                with_skill_folder = create_run_folder(
+                    batch_folder, 2 if not no_baseline else 1
+                )
+                with_skill_result = RunResult(
                     metadata=RunMetadata(
-                        model=eval_model,
+                        model=model,
                         task=skill.description,
                         batch_id=batch_id or "",
-                        run_number=1,
+                        run_number=2 if not no_baseline else 1,
                     ),
-                    stats=aggregate_conversation_stats(results.baseline_results),
-                    passed=results.baseline_success_rate > 0.5,
-                    assertions_passed=int(results.baseline_success_rate * len(test_cases)),
+                    stats=aggregate_conversation_stats(results.with_skill_results),
+                    passed=results.is_beneficial
+                    if not no_baseline
+                    else results.with_skill_success_rate > 0.5,
+                    assertions_passed=int(
+                        results.with_skill_success_rate * len(test_cases)
+                    ),
                     assertions_total=len(test_cases),
-                    run_type="baseline",
+                    run_type="with_skill",
                     skill_name=skill.name,
                 )
-                write_run_metadata(baseline_folder, baseline_result.metadata)
-                write_run_result(baseline_folder, baseline_result)
-                run_results.append(baseline_result)
+                write_run_metadata(with_skill_folder, with_skill_result.metadata)
+                write_run_result(with_skill_folder, with_skill_result)
+                run_results.append(with_skill_result)
 
-            # Log with-skill result
-            with_skill_folder = create_run_folder(batch_folder, 2 if not no_baseline else 1)
-            with_skill_result = RunResult(
-                metadata=RunMetadata(
-                    model=eval_model,
-                    task=skill.description,
+                # Write batch summary
+                summary = BatchSummary(
                     batch_id=batch_id or "",
-                    run_number=2 if not no_baseline else 1,
-                ),
-                stats=aggregate_conversation_stats(results.with_skill_results),
-                passed=results.is_beneficial
-                if not no_baseline
-                else results.with_skill_success_rate > 0.5,
-                assertions_passed=int(results.with_skill_success_rate * len(test_cases)),
-                assertions_total=len(test_cases),
-                run_type="with_skill",
-                skill_name=skill.name,
-            )
-            write_run_metadata(with_skill_folder, with_skill_result.metadata)
-            write_run_result(with_skill_folder, with_skill_result)
-            run_results.append(with_skill_result)
+                    model=model,
+                    task=skill.description,
+                    total_runs=len(run_results),
+                    passed_runs=sum(1 for r in run_results if r.passed),
+                    results=run_results,
+                )
+                write_batch_summary(batch_folder, summary)
 
-            # Write batch summary
-            summary = BatchSummary(
-                batch_id=batch_id or "",
-                model=eval_model,
-                task=skill.description,
-                total_runs=len(run_results),
-                passed_runs=sum(1 for r in run_results if r.passed),
-                results=run_results,
-            )
-            write_batch_summary(batch_folder, summary)
+            if verbose and not no_baseline:
+                console.print()
+                for i, (with_r, base_r) in enumerate(
+                    zip(results.with_skill_results, results.baseline_results), 1
+                ):
+                    base_icon = (
+                        "[green]OK[/green]" if base_r.success else "[red]FAIL[/red]"
+                    )
+                    skill_icon = (
+                        "[green]OK[/green]" if with_r.success else "[red]FAIL[/red]"
+                    )
+                    input_preview = with_r.test_case.input[:40]
+                    console.print(
+                        f"  {i}. {input_preview}  {base_icon} base  {skill_icon} skill"
+                    )
+                console.print()
 
-    if results is None:
-        return
-
-    if verbose and not no_baseline:
-        console.print()
-        for i, (with_r, base_r) in enumerate(
-            zip(results.with_skill_results, results.baseline_results), 1
-        ):
-            base_icon = "[green]OK[/green]" if base_r.success else "[red]FAIL[/red]"
-            skill_icon = "[green]OK[/green]" if with_r.success else "[red]FAIL[/red]"
-            input_preview = with_r.test_case.input[:40]
-            console.print(f"  {i}. {input_preview}  {base_icon} base  {skill_icon} skill")
-        console.print()
-
-    # Display results with horizontal bars
-    console.print()
-    if not no_baseline:
-        baseline_rate = results.baseline_success_rate
-        with_skill_rate = results.with_skill_success_rate
-        lift = results.skill_lift
-
-        baseline_bar = _render_bar(baseline_rate)
-        with_skill_bar = _render_bar(with_skill_rate)
-
-        lift_str = f"+{lift:.0%}" if lift >= 0 else f"{lift:.0%}"
-        lift_style = "green" if lift > 0 else "red" if lift < 0 else "dim"
-
-        console.print(f"  baseline   {baseline_bar}  {baseline_rate:>5.0%}")
-        console.print(
-            f"  with skill {with_skill_bar}  {with_skill_rate:>5.0%}  "
-            f"[{lift_style}]({lift_str})[/{lift_style}]"
-        )
-
-        # Token comparison
-        if results.baseline_total_tokens > 0:
-            savings = results.token_savings
-            savings_str = f"-{savings:.0%}" if savings >= 0 else f"+{-savings:.0%}"
-            savings_style = "green" if savings > 0 else "red" if savings < 0 else "dim"
+            # Display results with horizontal bars
             console.print()
-            console.print(
-                f"  tokens: {results.baseline_total_tokens} → {results.with_skill_total_tokens}  "
-                f"[{savings_style}]({savings_str})[/{savings_style}]"
-            )
-    else:
-        with_skill_rate = results.with_skill_success_rate
-        with_skill_bar = _render_bar(with_skill_rate)
-        console.print(f"  with skill {with_skill_bar}  {with_skill_rate:>5.0%}")
-        console.print(f"  tokens: {results.with_skill_total_tokens}")
+            if not no_baseline:
+                baseline_rate = results.baseline_success_rate
+                with_skill_rate = results.with_skill_success_rate
+                lift = results.skill_lift
 
-    if not no_baseline:
-        if results.is_beneficial:
-            console.print("\n[green]Recommendation: keep skill[/green]")
-        else:
-            console.print("\n[yellow]Recommendation: skill may not be beneficial[/yellow]")
+                baseline_bar = _render_bar(baseline_rate)
+                with_skill_bar = _render_bar(with_skill_rate)
 
+                lift_str = f"+{lift:.0%}" if lift >= 0 else f"{lift:.0%}"
+                lift_style = "green" if lift > 0 else "red" if lift < 0 else "dim"
 
-@main.command("list")
-@click.option("-d", "--dir", "skills_dir", type=click.Path(), help="Skills directory to list")
-def list_cmd(skills_dir: str | None):
-    """List generated skills."""
-    config = Config.load()
-    if skills_dir:
-        path = Path(skills_dir)
-    else:
-        path = config.skills_dir
+                console.print(f"  baseline   {baseline_bar}  {baseline_rate:>5.0%}")
+                console.print(
+                    f"  with skill {with_skill_bar}  {with_skill_rate:>5.0%}  "
+                    f"[{lift_style}]({lift_str})[/{lift_style}]"
+                )
 
-    if not path.exists():
-        console.print(f"No skills directory found at {path}")
-        return
+                # Token comparison
+                if results.baseline_total_tokens > 0:
+                    savings = results.token_savings
+                    savings_str = (
+                        f"-{savings:.0%}" if savings >= 0 else f"+{-savings:.0%}"
+                    )
+                    savings_style = (
+                        "green" if savings > 0 else "red" if savings < 0 else "dim"
+                    )
+                    console.print()
+                    console.print(
+                        f"  tokens: {results.baseline_total_tokens} → "
+                        f"{results.with_skill_total_tokens}  "
+                        f"[{savings_style}]({savings_str})[/{savings_style}]"
+                    )
+            else:
+                with_skill_rate = results.with_skill_success_rate
+                with_skill_bar = _render_bar(with_skill_rate)
+                console.print(f"  with skill {with_skill_bar}  {with_skill_rate:>5.0%}")
+                console.print(f"  tokens: {results.with_skill_total_tokens}")
 
-    skills = [d for d in path.iterdir() if d.is_dir() and (d / "SKILL.md").exists()]
-
-    if not skills:
-        console.print(f"No skills found in {path}")
-        return
-
-    console.print(f"Skills in {path}:\n")
-    for skill_dir in sorted(skills):
-        skill_md = skill_dir / "SKILL.md"
-        content = skill_md.read_text()
-        lines = content.split("\n")
-        name = skill_dir.name
-        description = lines[2] if len(lines) > 2 else ""
-        console.print(f"  [bold]{name}[/bold]")
-        if description:
-            console.print(f"    {description[:60]}...")
-        console.print()
+            if not no_baseline:
+                if results.is_beneficial:
+                    console.print("\n[green]Recommendation: keep skill[/green]")
+                else:
+                    console.print(
+                        "\n[yellow]Recommendation: skill may not be beneficial[/yellow]"
+                    )
 
 
-@main.command("runs")
-@click.option("-d", "--dir", "runs_dir", type=click.Path(exists=True), help="Runs directory")
-@click.option("--csv", "csv_output", type=click.Path(), help="Output CSV path")
-def runs_cmd(runs_dir: str | None, csv_output: str | None):
-    """Summarize run logs to CSV."""
-    config = Config.load()
-    runs_path = Path(runs_dir) if runs_dir else config.runs_dir
-
-    if not runs_path.exists():
-        console.print(f"[red]No runs directory found at {runs_path}[/red]")
-        sys.exit(1)
-
-    try:
-        output_path = summarize_runs_to_csv(runs_path, Path(csv_output) if csv_output else None)
-        console.print(f"Summary written to {output_path}")
-    except FileNotFoundError as e:
-        console.print(f"[red]{e}[/red]")
-        sys.exit(1)
-
-
-@main.command("benchmark")
-@click.argument("skill_path", type=click.Path(exists=True))
-@click.option("-m", "--model", "models", multiple=True, required=True, help="Model to benchmark")
-@click.option("--runs", "num_runs", type=int, default=3, help="Runs per model (default: 3)")
-@click.option("-t", "--tests", type=click.Path(exists=True), help="Test cases JSON file")
-@click.option("-o", "--output", type=click.Path(), help="Output directory for results")
-@click.option("-v", "--verbose", is_flag=True, help="Show per-run details")
-def benchmark_cmd(
-    skill_path: str,
-    models: tuple[str, ...],
-    num_runs: int,
-    tests: str | None,
-    output: str | None,
-    verbose: bool,
-):
-    """Benchmark a skill across multiple models.
-
-    Runs the skill's test cases multiple times per model and reports
-    pass rates and assertion statistics. MCP servers from fastagent.config.yaml
-    are automatically enabled.
-
-    Examples:
-
-        upskill benchmark ./skills/hf-eval-extraction/ -m haiku -m sonnet
-
-        upskill benchmark ./skills/my-skill/ -m gpt-4o -m claude-sonnet --runs 5
-
-        upskill benchmark ./skills/my-skill/ -m haiku -t ./custom_tests.json -v
-    """
-    asyncio.run(
-        _benchmark_async(
-            skill_path, list(models), num_runs, tests, output, verbose
-        )
-    )
-
-
-async def _benchmark_async(
-    skill_path: str,
+async def _run_benchmark_mode(
+    skill: Skill,
+    test_cases: list[TestCase],
     models: list[str],
     num_runs: int,
-    tests_path: str | None,
-    output_dir: str | None,
+    fast: FastAgent,
+    config: Config,
+    batch_id: str | None,
+    batch_folder: Path | None,
+    log_runs: bool,
     verbose: bool,
+    provider_info: str,
 ):
-    """Async implementation of benchmark command."""
+    """Run multi-model benchmark mode."""
     from upskill.evaluate import run_test
 
-    config = Config.load()
-    skill = Skill.load(Path(skill_path))
-
-    # Load test cases
-    if tests_path:
-        with open(tests_path, encoding="utf-8") as f:
-            data = json.load(f)
-        if "cases" in data:
-            test_cases = [TestCase(**tc) for tc in data["cases"]]
-        else:
-            test_cases = [TestCase(**tc) for tc in data]
-    elif skill.tests:
-        test_cases = skill.tests
-    else:
-        console.print("Generating test cases from skill...", style="dim")
-        test_cases = await generate_tests(skill.description, config=config)
-
-    # Setup output directory
-    if output_dir:
-        out_path = Path(output_dir)
-    else:
-        out_path = config.runs_dir
-
-    batch_id, batch_folder = create_batch_folder(out_path)
-    console.print(f"Results will be saved to: {batch_folder}", style="dim")
+    console.print(f"\nEvaluating [bold]{skill.name}[/bold] across {len(models)} model(s)")
+    console.print(
+        f"  {len(test_cases)} test case(s), {num_runs} run(s) per model{provider_info}\n"
+    )
 
     # Track results per model
     model_results: dict[str, list[RunResult]] = {m: [] for m in models}
-
-    console.print(f"\nBenchmarking [bold]{skill.name}[/bold] across {len(models)} model(s)")
-    console.print(f"  {len(test_cases)} test case(s), {num_runs} run(s) per model\n")
+    run_folder_counter = 0
 
     for model in models:
         console.print(f"[bold]{model}[/bold]")
 
         for run_num in range(1, num_runs + 1):
-            run_folder = create_run_folder(batch_folder, len(model_results[model]) + 1)
+            run_folder_counter += 1
+            run_folder = None
+            if log_runs and batch_folder:
+                run_folder = create_run_folder(batch_folder, run_folder_counter)
 
             # Run each test case
             total_assertions_passed = 0
             total_assertions = 0
-            total_tokens = 0
-            total_turns = 0
             all_passed = True
-            run_results: list[TestResult] = []
+            test_results: list[TestResult] = []
 
             for tc_idx, tc in enumerate(test_cases, 1):
                 if verbose:
-                    console.print(f"  Running test {tc_idx}/{len(test_cases)}...", style="dim")
+                    console.print(
+                        f"  Running test {tc_idx}/{len(test_cases)}...", style="dim"
+                    )
 
                 try:
                     result = await run_test(
-                        tc, fast=fast, skill=skill, model=model, config_path=config.effective_fastagent_config
+                        tc,
+                        fast=fast,
+                        skill=skill,
+                        model=model,
+                        config_path=config.effective_fastagent_config,
                     )
                 except Exception as e:
                     console.print(f"  [red]Test error: {e}[/red]")
@@ -893,30 +902,25 @@ async def _benchmark_async(
                 elif result.error:
                     if verbose:
                         console.print(f"    Error: {result.error}", style="dim")
-                    # Legacy: count as 1 assertion (failed)
                     total_assertions += 1
                 else:
-                    # Legacy: count as 1 assertion
                     total_assertions += 1
                     if result.success:
                         total_assertions_passed += 1
 
-                total_tokens += result.stats.total_tokens
-                total_turns += result.stats.turns
-
-                run_results.append(result)
+                test_results.append(result)
 
                 if not result.success:
                     all_passed = False
 
-            aggregated_stats = aggregate_conversation_stats(run_results)
+            aggregated_stats = aggregate_conversation_stats(test_results)
 
             # Create run result
             run_result = RunResult(
                 metadata=RunMetadata(
                     model=model,
                     task=skill.description,
-                    batch_id=batch_id,
+                    batch_id=batch_id or "",
                     run_number=run_num,
                 ),
                 stats=aggregated_stats,
@@ -927,26 +931,32 @@ async def _benchmark_async(
                 skill_name=skill.name,
             )
 
-            write_run_metadata(run_folder, run_result.metadata)
-            write_run_result(run_folder, run_result)
+            if log_runs and run_folder:
+                write_run_metadata(run_folder, run_result.metadata)
+                write_run_result(run_folder, run_result)
+
             model_results[model].append(run_result)
 
             # Display progress
             status = "[green]PASS[/green]" if all_passed else "[red]FAIL[/red]"
             if verbose:
+                total_tokens = aggregated_stats.total_tokens
                 console.print(
-                    f"  Run {run_num}: {total_assertions_passed}/{total_assertions} assertions  "
-                    f"{total_tokens} tokens  {status}"
+                    f"  Run {run_num}: {total_assertions_passed}/{total_assertions} "
+                    f"assertions  {total_tokens} tokens  {status}"
                 )
 
         # Summary for this model
         passes = sum(1 for r in model_results[model] if r.passed)
         avg_assertions = (
-            sum(r.assertions_passed for r in model_results[model]) / len(model_results[model])
+            sum(r.assertions_passed for r in model_results[model])
+            / len(model_results[model])
             if model_results[model]
             else 0
         )
-        total_possible = model_results[model][0].assertions_total if model_results[model] else 0
+        total_possible = (
+            model_results[model][0].assertions_total if model_results[model] else 0
+        )
         console.print(
             f"  Pass rate: {passes}/{num_runs} ({passes / num_runs:.0%})  "
             f"Avg assertions: {avg_assertions:.1f}/{total_possible}"
@@ -954,20 +964,21 @@ async def _benchmark_async(
         console.print()
 
     # Write batch summary
-    all_results = [r for results in model_results.values() for r in results]
-    summary = BatchSummary(
-        batch_id=batch_id,
-        model=",".join(models),
-        task=skill.description,
-        total_runs=len(all_results),
-        passed_runs=sum(1 for r in all_results if r.passed),
-        results=all_results,
-    )
-    write_batch_summary(batch_folder, summary)
+    if log_runs and batch_folder:
+        all_results = [r for results in model_results.values() for r in results]
+        summary = BatchSummary(
+            batch_id=batch_id or "",
+            model=",".join(models),
+            task=skill.description,
+            total_runs=len(all_results),
+            passed_runs=sum(1 for r in all_results if r.passed),
+            results=all_results,
+        )
+        write_batch_summary(batch_folder, summary)
 
     # Final summary table
     console.print()
-    table = Table(show_header=True, title="Benchmark Summary")
+    table = Table(show_header=True, title="Evaluation Summary")
     table.add_column("Model")
     table.add_column("Pass Rate")
     table.add_column("Avg Assertions")
@@ -976,11 +987,17 @@ async def _benchmark_async(
     for model in models:
         results = model_results[model]
         passes = sum(1 for r in results if r.passed)
-        avg_assertions = sum(r.assertions_passed for r in results) / len(results) if results else 0
+        avg_assertions = (
+            sum(r.assertions_passed for r in results) / len(results) if results else 0
+        )
         total_possible = results[0].assertions_total if results else 0
-        avg_tokens = sum(r.stats.total_tokens for r in results) / len(results) if results else 0
+        avg_tokens = (
+            sum(r.stats.total_tokens for r in results) / len(results) if results else 0
+        )
 
-        pass_style = "green" if passes == num_runs else "yellow" if passes > 0 else "red"
+        pass_style = (
+            "green" if passes == num_runs else "yellow" if passes > 0 else "red"
+        )
         table.add_row(
             model,
             f"[{pass_style}]{passes}/{num_runs}[/{pass_style}]",
@@ -989,7 +1006,195 @@ async def _benchmark_async(
         )
 
     console.print(table)
-    console.print(f"\nResults saved to: {batch_folder}")
+    if batch_folder:
+        console.print(f"\nResults saved to: {batch_folder}")
+
+
+@main.command("list")
+@click.option("-d", "--dir", "skills_dir", type=click.Path(), help="Skills directory to list")
+@click.option("-v", "--verbose", is_flag=True, help="Show skill contents preview")
+def list_cmd(skills_dir: str | None, verbose: bool):
+    """List generated skills.
+
+    Examples:
+
+        upskill list
+
+        upskill list -d ./my-skills/
+
+        upskill list -v
+    """
+    config = Config.load()
+    if skills_dir:
+        path = Path(skills_dir)
+    else:
+        path = config.skills_dir
+
+    if not path.exists():
+        console.print(f"[yellow]No skills directory found at {path}[/yellow]")
+        return
+
+    skills = [d for d in path.iterdir() if d.is_dir() and (d / "SKILL.md").exists()]
+
+    if not skills:
+        console.print(f"[yellow]No skills found in {path}[/yellow]")
+        return
+
+    # Build tree view
+    tree = Tree(f"[bold]{path}[/bold]")
+
+    for skill_dir in sorted(skills):
+        skill_md = skill_dir / "SKILL.md"
+        content = skill_md.read_text()
+        lines = content.split("\n")
+        name = skill_dir.name
+        description = lines[2] if len(lines) > 2 else ""
+
+        # Add skill to tree
+        skill_branch = tree.add(f"[bold cyan]{name}[/bold cyan]")
+        if description:
+            skill_branch.add(f"[dim]{description[:70]}{'...' if len(description) > 70 else ''}[/dim]")
+
+        # Add file details
+        files_branch = skill_branch.add("[dim]files[/dim]")
+        files_branch.add("SKILL.md")
+
+        # Check for references
+        refs_dir = skill_dir / "references"
+        if refs_dir.exists():
+            for ref_file in sorted(refs_dir.iterdir()):
+                files_branch.add(f"references/{ref_file.name}")
+
+        # Check for scripts
+        scripts_dir = skill_dir / "scripts"
+        if scripts_dir.exists():
+            for script_file in sorted(scripts_dir.iterdir()):
+                files_branch.add(f"scripts/{script_file.name}")
+
+        # Show preview if verbose
+        if verbose:
+            # Extract first meaningful content after frontmatter
+            in_frontmatter = False
+            preview_lines = []
+            for line in lines:
+                if line.strip() == "---":
+                    in_frontmatter = not in_frontmatter
+                    continue
+                if not in_frontmatter and line.strip() and not line.startswith("#"):
+                    preview_lines.append(line)
+                    if len(preview_lines) >= 3:
+                        break
+            if preview_lines:
+                preview = "\n".join(preview_lines)
+                skill_branch.add(Panel(Syntax(preview, "markdown", theme="monokai"), title="preview", border_style="dim"))
+
+    console.print(tree)
+
+
+@main.command("runs")
+@click.option("-d", "--dir", "runs_dir", type=click.Path(exists=True), help="Runs directory")
+@click.option("-s", "--skill", "skills", multiple=True, help="Filter by skill name(s)")
+@click.option("-m", "--model", "models", multiple=True, help="Filter by model(s)")
+@click.option(
+    "--metric",
+    type=click.Choice(["success", "tokens"]),
+    default="success",
+    help="Metric to display (default: success)",
+)
+@click.option("--csv", "csv_output", type=click.Path(), help="Export to CSV instead of plot")
+def runs_cmd(
+    runs_dir: str | None,
+    skills: tuple[str, ...],
+    models: tuple[str, ...],
+    metric: str,
+    csv_output: str | None,
+):
+    """View run results as a plot, or export to CSV.
+
+    By default, shows a visual comparison of baseline vs with-skill performance.
+    Use --csv to export data to CSV format instead.
+
+    Examples:
+
+        upskill runs
+
+        upskill runs -d ./runs/
+
+        upskill runs -s my-skill -m haiku -m sonnet
+
+        upskill runs --metric tokens
+
+        upskill runs --csv ./results.csv
+    """
+    config = Config.load()
+    runs_path = Path(runs_dir) if runs_dir else config.runs_dir
+
+    if not runs_path.exists():
+        console.print(f"[red]No runs directory found at {runs_path}[/red]")
+        sys.exit(1)
+
+    # CSV export mode
+    if csv_output:
+        try:
+            output_path = summarize_runs_to_csv(runs_path, Path(csv_output))
+            console.print(f"Summary written to {output_path}")
+        except FileNotFoundError as e:
+            console.print(f"[red]{e}[/red]")
+            sys.exit(1)
+        return
+
+    # Plot mode (default)
+    all_results = _load_eval_results(runs_path)
+
+    if not all_results:
+        console.print("[yellow]No eval results with baseline comparisons found.[/yellow]")
+        console.print("Run 'upskill eval <skill>' to generate comparable results.")
+        sys.exit(0)
+
+    # Filter by skills and models
+    if skills:
+        all_results = [r for r in all_results if r["skill_name"] in skills]
+    if models:
+        all_results = [r for r in all_results if r["model"] in models]
+
+    if not all_results:
+        console.print("[yellow]No results match the specified filters.[/yellow]")
+        sys.exit(0)
+
+    # Aggregate by model and skill (take most recent / highest)
+    aggregated: dict[tuple[str, str], dict] = {}
+    for r in all_results:
+        key = (r["model"], r["skill_name"])
+        if key not in aggregated or r["with_skill_rate"] > aggregated[key]["with_skill_rate"]:
+            aggregated[key] = r
+
+    results_list = list(aggregated.values())
+
+    # Determine display mode
+    unique_skills = set(r["skill_name"] for r in results_list)
+    unique_models = set(r["model"] for r in results_list)
+
+    console.print()
+
+    if len(unique_skills) == 1 and len(unique_models) >= 1:
+        # Single skill, multiple models
+        skill_name = list(unique_skills)[0]
+        console.print(f"[bold]skill: {skill_name}[/bold]\n")
+
+        for r in sorted(results_list, key=lambda x: x["model"]):
+            _print_comparison_bars(r, metric)
+
+    elif len(unique_models) == 1 and len(unique_skills) >= 1:
+        # Single model, multiple skills
+        model_name = list(unique_models)[0]
+        console.print(f"[bold]model: {model_name}[/bold]\n")
+
+        for r in sorted(results_list, key=lambda x: x["skill_name"]):
+            _print_comparison_bars(r, metric, label_field="skill_name")
+
+    else:
+        # Multiple skills and models - matrix view
+        _print_matrix_view(results_list, metric)
 
 
 def _render_bar(value: float, width: int = 20, filled: str = "█", empty: str = "░") -> str:
@@ -1059,97 +1264,6 @@ def _load_eval_results(runs_path: Path) -> list[dict]:
             })
 
     return results
-
-
-@main.command("plot")
-@click.option("-d", "--dir", "runs_dir", type=click.Path(exists=True), help="Runs directory")
-@click.option("-s", "--skill", "skills", multiple=True, help="Filter by skill name(s)")
-@click.option("-m", "--model", "models", multiple=True, help="Filter by model(s)")
-@click.option(
-    "--metric",
-    type=click.Choice(["success", "tokens"]),
-    default="success",
-    help="Metric to plot",
-)
-def plot_cmd(
-    runs_dir: str | None,
-    skills: tuple[str, ...],
-    models: tuple[str, ...],
-    metric: str,
-):
-    """Plot model performance: baseline vs with-skill.
-
-    Shows horizontal bar charts comparing performance with and without skills.
-
-    Examples:
-
-        upskill plot
-
-        upskill plot -d ./runs/
-
-        upskill plot -s my-skill -m haiku -m sonnet
-
-        upskill plot --metric tokens
-    """
-    config = Config.load()
-    runs_path = Path(runs_dir) if runs_dir else config.runs_dir
-
-    if not runs_path.exists():
-        console.print(f"[red]No runs directory found at {runs_path}[/red]")
-        sys.exit(1)
-
-    # Load all eval results
-    all_results = _load_eval_results(runs_path)
-
-    if not all_results:
-        console.print("[yellow]No eval results with baseline comparisons found.[/yellow]")
-        console.print("Run 'upskill eval <skill>' to generate comparable results.")
-        sys.exit(0)
-
-    # Filter by skills and models
-    if skills:
-        all_results = [r for r in all_results if r["skill_name"] in skills]
-    if models:
-        all_results = [r for r in all_results if r["model"] in models]
-
-    if not all_results:
-        console.print("[yellow]No results match the specified filters.[/yellow]")
-        sys.exit(0)
-
-    # Aggregate by model and skill (take most recent / highest)
-    aggregated: dict[tuple[str, str], dict] = {}
-    for r in all_results:
-        key = (r["model"], r["skill_name"])
-        if key not in aggregated or r["with_skill_rate"] > aggregated[key]["with_skill_rate"]:
-            aggregated[key] = r
-
-    results_list = list(aggregated.values())
-
-    # Determine display mode
-    unique_skills = set(r["skill_name"] for r in results_list)
-    unique_models = set(r["model"] for r in results_list)
-
-    console.print()
-
-    if len(unique_skills) == 1 and len(unique_models) >= 1:
-        # Single skill, multiple models
-        skill_name = list(unique_skills)[0]
-        console.print(f"[bold]skill: {skill_name}[/bold]\n")
-
-        for r in sorted(results_list, key=lambda x: x["model"]):
-            _print_comparison_bars(r, metric)
-
-    elif len(unique_models) == 1 and len(unique_skills) >= 1:
-        # Single model, multiple skills
-        model_name = list(unique_models)[0]
-        console.print(f"[bold]model: {model_name}[/bold]\n")
-
-        for r in sorted(results_list, key=lambda x: x["skill_name"]):
-            _print_comparison_bars(r, metric, label_field="skill_name")
-
-    else:
-        # Multiple skills and models - matrix view
-        _print_matrix_view(results_list, metric)
 
 
 def _print_comparison_bars(result: dict, metric: str, label_field: str = "model") -> None:

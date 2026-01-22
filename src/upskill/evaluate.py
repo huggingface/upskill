@@ -10,7 +10,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
-from fast_agent import ConversationSummary, FastAgent
+from fast_agent import ConversationSummary
 from fast_agent.agents.llm_agent import LlmAgent
 
 from upskill.fastagent_integration import (
@@ -172,26 +172,22 @@ async def _run_test_with_evaluator(
 
 async def run_test(
     test_case: TestCase,
-    fast: FastAgent,
+    evaluator: LlmAgent,
     skill: Skill | None,
-    model: str,
-    config_path: Path,
     use_workspace: bool | None = None,
 ) -> TestResult:
-    """Run a single test case using FastAgent.
+    """Run a single test case using an evaluator agent.
 
     Args:
         test_case: The test case to run
+        evaluator: The evaluator agent to use
         skill: Optional skill to inject (None for baseline)
-        model: Model name
-        config_path: Path to fastagent config
         use_workspace: Force workspace isolation (auto-detected from test_case.validator)
     """
-
-
     try:
-        evaluator = fast.app.evaluator
-        instruction = compose_instruction(evaluator.instruction, skill) if skill else None
+        instruction = (
+            compose_instruction(evaluator.instruction, skill) if skill else None
+        )
         return await _run_test_with_evaluator(
             test_case,
             evaluator,
