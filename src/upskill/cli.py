@@ -16,6 +16,7 @@ from upskill.config import Config
 from upskill.evaluate import evaluate_skill, get_failure_descriptions
 from upskill.generate import generate_skill, generate_tests, improve_skill, refine_skill
 from upskill.logging import (
+    aggregate_conversation_stats,
     create_batch_folder,
     create_run_folder,
     summarize_runs_to_csv,
