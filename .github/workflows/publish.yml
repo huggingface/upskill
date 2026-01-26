@@ -15,7 +15,7 @@ jobs:
         uses: astral-sh/setup-uv@v5
 
       - name: Set up Python
-        run: uv python install 3.11
+        run: uv python install 3.13.5
 
       - name: Build package
         run: uv build
