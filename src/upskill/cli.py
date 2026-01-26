@@ -4,13 +4,14 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from contextlib import asynccontextmanager
 from importlib import resources
 from pathlib import Path
-from typing import TypedDict
+from typing import AsyncIterator, TypedDict
 
 import click
 from dotenv import load_dotenv
-from fast_agent import FastAgent, RequestParams
+from fast_agent import FastAgent
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -42,6 +43,25 @@ from upskill.models import (
 load_dotenv()
 
 console = Console()
+
+
+@asynccontextmanager
+async def _fast_agent_context() -> AsyncIterator[object]:
+    fast = FastAgent(
+        "upskill",
+        ignore_unknown_args=True,
+    )
+
+    @fast.agent()
+    async def empty():
+        pass
+
+    cards = resources.files("upskill").joinpath("agent_cards")
+    with resources.as_file(cards) as cards_path:
+        fast.load_agents(cards_path)
+
+    async with fast.run() as agent:
+        yield agent
 
 
 def _render_bar(value: float, width: int = 20) -> str:
@@ -259,47 +279,10 @@ async def _generate_async(
         console.print(f"Logging runs to: {batch_folder}", style="dim")
 
 
-    # todo -- legacy in f-a.
-
-
-    fast = FastAgent(
-        "upskill",
-        ignore_unknown_args=True,
-        # NB - at the moment we let fast-agent see CLI arguments.
-        # Check for conflicts/consistency/behaviour required.
-        # parse_cli_args=False,
-        # config_path=str(CONFIG_PATH),
-        # environment_dir=environment_dir,
-        # skills_directory=[skills_manifest_dir],
-    )
-
-    @fast.agent()
-    async def empty():
-        pass
-
-
-    # load agents from card files
-    cards = resources.files("upskill").joinpath("agent_cards")
-    with resources.as_file(cards) as cards_path:
-        fast.load_agents(cards_path)
-
-
-    # tidy this up later.
-    evaluator_data = fast.agents.get("evaluator")
-    if evaluator_data and eval_model:
-        fa_config = evaluator_data.get("config")
-        if fa_config:
-            fa_config.model = eval_model
-            if fa_config.default_request_params is not None:
-                params = fa_config.default_request_params.model_dump(exclude={"model", "maxTokens"})
-                fa_config.default_request_params = RequestParams(**params)
-
-
     skill: Skill | None = None
     results = None
-    eval_results = None
 
-    async with fast.run() as agent:
+    async with _fast_agent_context() as agent:
 
         # Generate from trace file
         if from_trace:
@@ -547,7 +530,9 @@ async def _generate_async(
         if results:
             skill.metadata.test_pass_rate = results.with_skill_success_rate
         else:
-            console.print("[yellow]No evaluation results available; skipping report output.[/yellow]")
+            console.print(
+                "[yellow]No evaluation results available; skipping report output.[/yellow]"
+            )
 
         _save_and_display(skill, output, config, results, eval_results, gen_model, eval_model)
 
@@ -732,27 +717,13 @@ async def _eval_async(
         console.print(f"[red]No SKILL.md found in {skill_dir}[/red]")
         sys.exit(1)
 
-    fast = FastAgent(
-        "upskill",
-        ignore_unknown_args=True,
-    )
-
-    @fast.agent()
-    async def empty():
-        pass
-
-    cards = resources.files("upskill").joinpath("agent_cards")
-    with resources.as_file(cards) as cards_path:
-        fast.load_agents(cards_path)
-
     # Use default model if none specified
     if not models:
         models = [config.effective_eval_model]
 
-    # Determine if this is multi-model or multi-run mode (benchmark mode)
     is_benchmark_mode = len(models) > 1 or num_runs > 1
 
-    async with fast.run() as agent:
+    async with _fast_agent_context() as agent:
         # Load test cases
         test_cases: list[TestCase] = []
         if tests:
@@ -1116,6 +1087,207 @@ def list_cmd(skills_dir: str | None, verbose: bool):
     console.print()
     console.print(f"[dim]{len(skills)} skills, ~{total_tokens:,} total tokens[/dim]")
 
+
+@main.command("benchmark")
+@click.argument("skill_path", type=click.Path(exists=True))
+@click.option("-m", "--model", "models", multiple=True, required=True, help="Model to benchmark")
+@click.option("--runs", "num_runs", type=int, default=3, help="Runs per model (default: 3)")
+@click.option("-t", "--tests", type=click.Path(exists=True), help="Test cases JSON file")
+@click.option("-o", "--output", type=click.Path(), help="Output directory for results")
+@click.option("-v", "--verbose", is_flag=True, help="Show per-run details")
+def benchmark_cmd(
+    skill_path: str,
+    models: tuple[str, ...],
+    num_runs: int,
+    tests: str | None,
+    output: str | None,
+    verbose: bool,
+):
+    """Benchmark a skill across multiple models.
+
+    Runs the skill's test cases multiple times per model and reports
+    pass rates and assertion statistics. MCP servers from fastagent.config.yaml
+    are automatically enabled.
+
+    Examples:
+
+        upskill benchmark ./skills/hf-eval-extraction/ -m haiku -m sonnet
+
+        upskill benchmark ./skills/my-skill/ -m gpt-4o -m claude-sonnet --runs 5
+
+        upskill benchmark ./skills/my-skill/ -m haiku -t ./custom_tests.json -v
+    """
+    asyncio.run(
+        _benchmark_async(
+            skill_path, list(models), num_runs, tests, output, verbose
+        )
+    )
+
+
+async def _benchmark_async(
+    skill_path: str,
+    models: list[str],
+    num_runs: int,
+    tests_path: str | None,
+    output_dir: str | None,
+    verbose: bool,
+):
+    """Async implementation of benchmark command."""
+    from upskill.evaluate import run_test
+
+    config = Config.load()
+    skill = Skill.load(Path(skill_path))
+
+    async with _fast_agent_context() as agent:
+        # Load test cases
+        if tests_path:
+            with open(tests_path, encoding="utf-8") as f:
+                data = json.load(f)
+            if "cases" in data:
+                test_cases = [TestCase(**tc) for tc in data["cases"]]
+            else:
+                test_cases = [TestCase(**tc) for tc in data]
+        elif skill.tests:
+            test_cases = skill.tests
+        else:
+            console.print("Generating test cases from skill...", style="dim")
+            test_cases = await generate_tests(
+                skill.description,
+                generator=agent.test_gen,
+            )
+
+        # Setup output directory
+        if output_dir:
+            out_path = Path(output_dir)
+        else:
+            out_path = config.runs_dir
+
+        batch_id, batch_folder = create_batch_folder(out_path)
+        console.print(f"Results will be saved to: {batch_folder}", style="dim")
+
+        # Track results per model
+        model_results: dict[str, list[RunResult]] = {m: [] for m in models}
+        all_run_results: list[RunResult] = []
+
+        console.print(f"\nBenchmarking [bold]{skill.name}[/bold] across {len(models)} model(s)")
+        console.print(f"  {len(test_cases)} test case(s), {num_runs} run(s) per model\n")
+
+        for model in models:
+            console.print(f"[bold]{model}[/bold]")
+
+            for run_num in range(1, num_runs + 1):
+                run_folder = create_run_folder(batch_folder, len(all_run_results) + 1)
+
+                # Run each test case
+                total_assertions_passed = 0
+                total_assertions = 0
+                all_passed = True
+                run_results: list[TestResult] = []
+
+                for tc_idx, tc in enumerate(test_cases, 1):
+                    if verbose:
+                        console.print(f"  Running test {tc_idx}/{len(test_cases)}...", style="dim")
+
+                    try:
+                        result = await run_test(
+                            tc,
+                            evaluator=agent.evaluator,
+                            skill=skill,
+                        )
+                    except Exception as e:
+                        console.print(f"  [red]Test error: {e}[/red]")
+                        result = TestResult(test_case=tc, success=False, error=str(e))
+
+                    # Extract assertion counts from validation result
+                    if result.validation_result:
+                        total_assertions_passed += result.validation_result.assertions_passed
+                        total_assertions += result.validation_result.assertions_total
+                        if verbose and result.validation_result.error_message:
+                            console.print(
+                                f"    Validation: {result.validation_result.error_message}",
+                                style="dim",
+                            )
+                    elif result.error:
+                        if verbose:
+                            console.print(f"    Error: {result.error}", style="dim")
+                        # Legacy: count as 1 assertion (failed)
+                        total_assertions += 1
+                    else:
+                        # Legacy: count as 1 assertion
+                        total_assertions += 1
+                        if result.success:
+                            total_assertions_passed += 1
+
+                    run_results.append(result)
+
+                    if not result.success:
+                        all_passed = False
+
+                aggregated_stats = aggregate_conversation_stats(run_results)
+
+                # Create run result
+                run_result = RunResult(
+                    metadata=RunMetadata(
+                        model=model,
+                        task=skill.description,
+                        batch_id=batch_id,
+                        run_number=run_num,
+                    ),
+                    stats=aggregated_stats,
+                    passed=all_passed,
+                    assertions_passed=total_assertions_passed,
+                    assertions_total=total_assertions,
+                    run_type="with_skill",
+                    skill_name=skill.name,
+                )
+
+                write_run_metadata(run_folder, run_result.metadata)
+                write_run_result(run_folder, run_result)
+                model_results[model].append(run_result)
+                all_run_results.append(run_result)
+
+                # Display progress
+                status = "[green]PASS[/green]" if all_passed else "[red]FAIL[/red]"
+                if verbose:
+                    console.print(
+                        f"  Run {run_num}: {status} "
+                        f"({total_assertions_passed}/{total_assertions} assertions passed)"
+                    )
+
+        console.print("\n[bold]Summary[/bold]\n")
+
+        for model, results in model_results.items():
+            total_runs = len(results)
+            passed_runs = sum(1 for r in results if r.passed)
+            avg_tokens = (
+                sum(r.stats.total_tokens for r in results) / total_runs if total_runs else 0
+            )
+            avg_turns = (
+                sum(r.stats.turns for r in results) / total_runs if total_runs else 0
+            )
+
+            pass_rate = passed_runs / total_runs if total_runs else 0
+            pass_rate_str = f"{pass_rate:.0%}"
+            pass_rate_style = "green" if pass_rate > 0.5 else "yellow" if pass_rate > 0 else "red"
+
+            console.print(f"[bold]{model}[/bold]")
+            console.print(
+                "  Runs: "
+                f"{total_runs} | Passed: {passed_runs} ([{pass_rate_style}]"
+                f"{pass_rate_str}[/{pass_rate_style}])"
+            )
+            console.print(f"  Avg tokens: {avg_tokens:.0f} | Avg turns: {avg_turns:.1f}")
+            console.print()
+
+        summary = BatchSummary(
+            batch_id=batch_id,
+            model=", ".join(models),
+            task=skill.description,
+            total_runs=len(all_run_results),
+            passed_runs=sum(1 for r in all_run_results if r.passed),
+            results=all_run_results,
+        )
+        write_batch_summary(batch_folder, summary)
 
 @main.command("runs")
 @click.option("-d", "--dir", "runs_dir", type=click.Path(exists=True), help="Runs directory")

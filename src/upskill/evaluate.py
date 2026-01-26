@@ -123,8 +123,10 @@ async def _run_test_with_evaluator(
         clone: LlmAgent | None = None
         try:
             clone = await evaluator.spawn_detached_instance(name=instance_name)
-            
-            if instruction:
+
+            if instruction is None:
+                clone.set_instruction("")
+            else:
                 clone.set_instruction(instruction)
             output = await clone.send(user_content)
             stats = ConversationStats()
@@ -176,6 +178,7 @@ async def run_test(
     evaluator: LlmAgent,
     skill: Skill | None,
     use_workspace: bool | None = None,
+    model: str | None = None,
 ) -> TestResult:
     """Run a single test case using an evaluator agent.
 
@@ -187,6 +190,8 @@ async def run_test(
     """
 
     try:
+        if model is not None:
+            await evaluator.set_model(model)
         instruction = compose_instruction(evaluator.instruction, skill) if skill else None
         return await _run_test_with_evaluator(
             test_case,
@@ -220,7 +225,6 @@ async def evaluate_skill(
 
     results = EvalResults(skill_name=skill.name, model=model)
 
-
     base_instruction = evaluator.instruction
 
     async def _run_batch(
@@ -239,6 +243,9 @@ async def evaluate_skill(
                 )
             )
         return await asyncio.gather(*tasks)
+
+    if model is not None:
+        await evaluator.set_model(model)
 
     # Run with skill
     skill_instruction = compose_instruction(base_instruction, skill)
