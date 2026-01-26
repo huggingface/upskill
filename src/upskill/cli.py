@@ -280,9 +280,6 @@ async def _generate_async(
         console.print(f"Logging runs to: {batch_folder}", style="dim")
 
 
-    skill: Skill | None = None
-    results = None
-
     async with _fast_agent_context() as agent:
 
         # Generate from trace file
