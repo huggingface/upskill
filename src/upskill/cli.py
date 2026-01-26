@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from importlib import resources
 from pathlib import Path
-from typing import AsyncIterator, TypedDict
+from typing import TypedDict
 
 import click
 from dotenv import load_dotenv
@@ -278,9 +279,6 @@ async def _generate_async(
         batch_id, batch_folder = create_batch_folder(runs_path)
         console.print(f"Logging runs to: {batch_folder}", style="dim")
 
-
-    skill: Skill | None = None
-    results = None
 
     async with _fast_agent_context() as agent:
 
@@ -759,8 +757,13 @@ async def _eval_async(
 
         if is_benchmark_mode:
             # Benchmark mode: multiple models and/or runs
-            console.print(f"\nEvaluating [bold]{skill.name}[/bold] across {len(models)} model(s)")
-            console.print(f"  {len(test_cases)} test case(s), {num_runs} run(s) per model{provider_info}\n")
+            console.print(
+                f"\nEvaluating [bold]{skill.name}[/bold] across {len(models)} model(s)"
+            )
+            console.print(
+                f"  {len(test_cases)} test case(s), "
+                f"{num_runs} run(s) per model{provider_info}\n"
+            )
 
             model_results: dict[str, list[RunResult]] = {m: [] for m in models}
             all_run_results: list[RunResult] = []
@@ -783,7 +786,10 @@ async def _eval_async(
 
                     for tc_idx, tc in enumerate(test_cases, 1):
                         if verbose:
-                            console.print(f"  Running test {tc_idx}/{len(test_cases)}...", style="dim")
+                            console.print(
+                                f"  Running test {tc_idx}/{len(test_cases)}...",
+                                style="dim",
+                            )
 
                         try:
                             result = await run_test(
@@ -864,7 +870,12 @@ async def _eval_async(
 
                 pass_rate = passed_runs / total_runs if total_runs else 0
                 pass_rate_str = f"{pass_rate:.0%}"
-                pass_rate_style = "green" if pass_rate > 0.5 else "yellow" if pass_rate > 0 else "red"
+                if pass_rate > 0.5:
+                    pass_rate_style = "green"
+                elif pass_rate > 0:
+                    pass_rate_style = "yellow"
+                else:
+                    pass_rate_style = "red"
 
                 console.print(f"[bold]{model}[/bold]")
                 console.print(
@@ -993,10 +1004,12 @@ async def _eval_async(
                     savings_str = f"-{savings:.0%}" if savings >= 0 else f"+{-savings:.0%}"
                     savings_style = "green" if savings > 0 else "red" if savings < 0 else "dim"
                     console.print()
-                    console.print(
-                        f"  tokens: {results.baseline_total_tokens} → {results.with_skill_total_tokens}  "
+                    token_line = (
+                        f"  tokens: {results.baseline_total_tokens} → "
+                        f"{results.with_skill_total_tokens}  "
                         f"[{savings_style}]({savings_str})[/{savings_style}]"
                     )
+                    console.print(token_line)
             else:
                 with_skill_rate = results.with_skill_success_rate
                 with_skill_bar = _render_bar(with_skill_rate)
@@ -1383,7 +1396,8 @@ def runs_cmd(
             content_lines.append(_format_comparison_bars(r, metric))
 
         panel_content = "\n".join(content_lines)
-        console.print(Panel(panel_content, title=f"Evaluation History: {skill_name}", border_style="blue"))
+        panel_title = f"Evaluation History: {skill_name}"
+        console.print(Panel(panel_content, title=panel_title, border_style="blue"))
 
     elif len(unique_models) == 1 and len(unique_skills) >= 1:
         # Single model, multiple skills - use Panel
@@ -1394,7 +1408,8 @@ def runs_cmd(
             content_lines.append(_format_comparison_bars(r, metric, label_field="skill_name"))
 
         panel_content = "\n".join(content_lines)
-        console.print(Panel(panel_content, title=f"Evaluation History: {model_name}", border_style="blue"))
+        panel_title = f"Evaluation History: {model_name}"
+        console.print(Panel(panel_content, title=panel_title, border_style="blue"))
 
     else:
         # Multiple skills and models - matrix view with Panel
@@ -1423,7 +1438,14 @@ def plot_cmd(
 ):
     """[Deprecated] Use 'upskill runs' instead."""
     console.print("[yellow]Note: 'plot' is deprecated. Use 'upskill runs' instead.[/yellow]\n")
-    ctx.invoke(runs_cmd, runs_dir=runs_dir, skills=skills, models=models, csv_output=None, metric=metric)
+    ctx.invoke(
+        runs_cmd,
+        runs_dir=runs_dir,
+        skills=skills,
+        models=models,
+        csv_output=None,
+        metric=metric,
+    )
 
 
 def _format_comparison_bars(
