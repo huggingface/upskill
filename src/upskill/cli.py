@@ -731,14 +731,30 @@ async def _eval_async(
                 test_cases = [TestCase(**tc) for tc in data["cases"]]
             else:
                 test_cases = [TestCase(**tc) for tc in data]
+            test_source = f"tests file: {tests}"
         elif skill.tests:
             test_cases = skill.tests
+            test_source = "skill_meta.json"
         else:
             console.print("Generating test cases from skill...", style="dim")
             test_cases = await generate_tests(
                 skill.description,
                 generator=agent.test_gen,
                 model=models[0],
+            )
+            test_source = "generated"
+
+        invalid_expected = 0
+        for tc in test_cases:
+            expected_values = [value.strip() for value in tc.expected.contains if value.strip()]
+            if len(expected_values) < 2:
+                invalid_expected += 1
+        console.print(
+            f"[dim]Loaded {len(test_cases)} test case(s) from {test_source}[/dim]"
+        )
+        if invalid_expected:
+            console.print(
+                f"[yellow]{invalid_expected} test case(s) missing expected strings[/yellow]"
             )
 
         # Setup run logging
