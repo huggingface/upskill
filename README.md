@@ -189,8 +189,8 @@ sonnet
 
 ```json
 [
-  {"input": "Write a commit for adding login", "expected": {"contains": "feat"}},
-  {"input": "Fix the null pointer bug", "expected": {"contains": "fix"}}
+  {"input": "Write a commit for adding login", "expected": {"contains": ["feat", "login"]}},
+  {"input": "Fix the null pointer bug", "expected": {"contains": ["fix", "bug"]}}
 ]
 ```
 

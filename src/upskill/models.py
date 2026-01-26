@@ -7,7 +7,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class SkillMetadata(BaseModel):
@@ -33,23 +33,50 @@ class ValidationResult(BaseModel):
     error_message: str | None = None
 
 
+class ExpectedSpec(BaseModel):
+    """Expected output checks for a test case."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    contains: list[str]
+
+    @field_validator("contains", mode="before")
+    @classmethod
+    def coerce_contains(cls, value: str | list[str]) -> list[str]:
+        if isinstance(value, str):
+            return [value]
+        return value
+
+
+class TestCaseContext(BaseModel):
+    """Context payloads provided to the evaluator."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    files: dict[str, str] | None = None
+
+
 class TestCase(BaseModel):
     """A test case for skill evaluation."""
 
+    model_config = ConfigDict(extra="forbid")
+
     input: str  # Task/prompt to give the agent
-    context: dict | None = None  # Files, env vars, etc.
-    expected: dict | None = None  # Expected output checks
+    context: TestCaseContext | None = None  # Files, env vars, etc.
+    expected: ExpectedSpec  # Expected output checks
 
     # Custom validator support
     output_file: str | None = None  # File to validate instead of agent output
     validator: str | None = None  # Validator name (e.g., "hf_eval_yaml")
-    validator_config: dict | None = None  # Config passed to validator
+    validator_config: dict[str, str | int | float | bool] | None = None
 
 
 
 
 class TestCaseSuite(BaseModel):
     """Structured container for a list of test cases."""
+
+    model_config = ConfigDict(extra="forbid")
 
     cases: list[TestCase] = Field(default_factory=list)
 

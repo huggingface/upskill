@@ -22,19 +22,19 @@ Output:
   "cases": [
     {
       "input": "Write a commit message for adding a new login feature",
-      "expected": {"contains": "feat"}
+      "expected": {"contains": ["feat", "login"]}
     },
     {
       "input": "Write a commit message for fixing a null pointer bug in the user service",
-      "expected": {"contains": "fix"}
+      "expected": {"contains": ["fix", "bug"]}
     },
     {
       "input": "Write a commit message for updating the README documentation",
-      "expected": {"contains": "docs"}
+      "expected": {"contains": ["docs", "readme"]}
     },
     {
       "input": "Write a commit message for a breaking API change",
-      "expected": {"contains": "BREAKING"}
+      "expected": {"contains": ["BREAKING", "api"]}
     }
   ]
 }
@@ -48,15 +48,15 @@ Output:
   "cases": [
     {
       "input": "Write code to fetch data from an API with retry logic",
-      "expected": {"contains": "retry"}
+      "expected": {"contains": ["retry", "error"]}
     },
     {
       "input": "How should I handle a 500 error from an API?",
-      "expected": {"contains": "backoff"}
+      "expected": {"contains": ["backoff", "500"]}
     },
     {
       "input": "Write error handling for a requests.get call",
-      "expected": {"contains": "except"}
+      "expected": {"contains": ["except", "requests"]}
     }
   ]
 }
@@ -72,13 +72,8 @@ TEST_GENERATION_PROMPT = (
     "## Your Task\n\n"
     f"Task: {TASK_PLACEHOLDER}\n\n"
     "Generate test cases that verify the agent can apply the skill correctly.\n\n"
-    "Output ONLY a valid JSON object (no markdown code blocks):\n"
-    "{\n"
-    '  "cases": [\n'
-    '    {"input": "prompt/question for the agent",\n'
-    '     "expected": {"contains": "substring that should appear in good response"}}\n'
-    "  ]\n"
-    "}\n\n"
+
+    "Each TestCase MUST include at least a list of expected strings in the expected field.\n"
     "Focus on practical scenarios that test understanding of the core concepts."
 )
 
@@ -113,9 +108,6 @@ async def generate_skill(
     model: str | None = None,
 ) -> Skill:
     """Generate a skill from a task description using FastAgent."""
-    # config = config or Config.load()
-    # model = model or config.model
-    # config_path = config.effective_fastagent_config
 
     prompt = f"Create a skill document that teaches an AI agent how to: {task}"
     if examples:
@@ -142,19 +134,31 @@ async def generate_tests(
     model: str | None = None,
 ) -> list[TestCase]:
     """Generate synthetic test cases from a task description using FastAgent."""
-    # config = config or Config.load()
-    # model = model or config.model
-    # config_path = config.effective_fastagent_config
 
     prompt = TEST_GENERATION_PROMPT.replace(TASK_PLACEHOLDER, task)
 
-
     result, _ = await generator.structured(prompt, TestCaseSuite)
-
     if result is None:
         raise ValueError("Test generator did not return structured test cases.")
 
-    return result.cases
+    cases = result.cases
+    invalid_expected = 0
+    for tc in cases:
+        expected_values = [value.strip() for value in tc.expected.contains if value.strip()]
+        if len(expected_values) < 2:
+            invalid_expected += 1
+
+    print(
+        "Generated test cases:",
+        f"total={len(cases)}",
+        f"invalid_expected={invalid_expected}",
+    )
+    if invalid_expected:
+        print(
+            "Warning: some test cases are missing at least two expected strings; "
+            "review generated tests."
+        )
+    return cases
 
 
 async def refine_skill(
@@ -259,4 +263,3 @@ async def improve_skill(
         source_task=f"Improved from {skill.name}: {instructions}",
         base_skill=skill,
     )
-
