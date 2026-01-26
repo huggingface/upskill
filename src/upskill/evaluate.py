@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import shutil
 import tempfile
 from collections.abc import Generator
@@ -49,12 +48,9 @@ def isolated_workspace(base_dir: Path | None = None, cleanup: bool = True) -> Ge
     """
     workspace = tempfile.mkdtemp(dir=base_dir, prefix="upskill_run_")
     workspace_path = Path(workspace)
-    original_cwd = Path.cwd()
     try:
-        os.chdir(workspace_path)
         yield workspace_path
     finally:
-        os.chdir(original_cwd)
         if cleanup:
             try:
                 shutil.rmtree(workspace_path, ignore_errors=True)
@@ -123,6 +119,11 @@ async def _run_test_with_evaluator(
         clone: LlmAgent | None = None
         try:
             clone = await evaluator.spawn_detached_instance(name=instance_name)
+            if workspace is not None:
+                enable_shell = getattr(clone, "enable_shell", None)
+                shell_enabled = getattr(clone, "shell_runtime_enabled", False)
+                if shell_enabled and callable(enable_shell):
+                    enable_shell(working_directory=workspace)
 
             if instruction is None:
                 clone.set_instruction("")
