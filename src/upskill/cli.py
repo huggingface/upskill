@@ -202,11 +202,24 @@ def generate(
 
         upskill generate "document code" --no-log-runs
     """
+    # Auto-detect if --from is a skill directory or trace file
+    from_trace = None
+    if from_skill:
+        source_path = Path(from_skill)
+        if not source_path.is_dir():
+            # It's a file, treat it as trace
+            from_trace = from_skill
+            from_skill = None
+    # Or use trace parameter directly
+    if trace:
+        from_trace = trace
+    
     asyncio.run(
         _generate_async(
             task,
             list(example) if example else None,
             from_skill,
+            from_trace,
             model,
             output,
             no_eval,
@@ -221,6 +234,7 @@ async def _generate_async(
     task: str,
     examples: list[str] | None,
     from_skill: str | None,
+    from_trace: str | None,
     model: str | None,
     output: str | None,
     no_eval: bool,
