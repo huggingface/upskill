@@ -20,6 +20,7 @@ from upskill.logging import extract_stats_from_summary
 from upskill.models import (
     ConversationStats,
     EvalResults,
+    ExpectedSpec,
     Skill,
     TestCase,
     TestResult,
@@ -60,7 +61,7 @@ def isolated_workspace(base_dir: Path | None = None, cleanup: bool = True) -> Ge
 
 def check_expected(
     output: str,
-    expected: dict | None,
+    expected: ExpectedSpec,
     workspace: Path | None = None,
     test_case: TestCase | None = None,
 ) -> tuple[bool, ValidationResult | None]:
@@ -87,13 +88,10 @@ def check_expected(
             )
             return result.passed, result
 
-    # Legacy: simple contains check
-    if not expected:
-        return True, None
-
-    if "contains" in expected:
-        if expected["contains"].lower() not in output.lower():
-            return False, None
+    required = expected.contains
+    output_lower = output.lower()
+    if any(item.lower() not in output_lower for item in required):
+        return False, None
 
     return True, None
 
@@ -108,8 +106,8 @@ async def _run_test_with_evaluator(
 ) -> TestResult:
     """Run a single test case using a provided evaluator agent."""
     user_content = test_case.input
-    if test_case.context and "files" in test_case.context:
-        for filename, content in test_case.context["files"].items():
+    if test_case.context and test_case.context.files:
+        for filename, content in test_case.context.files.items():
             user_content += f"\n\n```{filename}\n{content}\n```"
 
     # Determine if we need workspace isolation
@@ -143,11 +141,17 @@ async def _run_test_with_evaluator(
             # Check expected with custom validator support
             if workspace and test_case.validator:
                 success, validation_result = check_expected(
-                    output or "", test_case.expected, workspace, test_case
+                    output or "",
+                    test_case.expected,
+                    workspace,
+                    test_case,
                 )
             else:
                 success, validation_result = check_expected(
-                    output or "", test_case.expected
+                    output or "",
+                    test_case.expected,
+                    None,
+                    test_case,
                 )
 
             return TestResult(
