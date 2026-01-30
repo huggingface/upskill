@@ -63,8 +63,6 @@ upskill generate TASK [OPTIONS]
 - `-o, --output PATH` - Output directory for skill
 - `--no-eval` - Skip evaluation and refinement
 - `--eval-model MODEL` - Different model to evaluate skill on
-- `--eval-provider [anthropic|openai|generic]` - API provider for eval model
-- `--eval-base-url URL` - Custom API endpoint for eval model
 - `--runs-dir PATH` - Directory for run logs (default: ./runs)
 - `--log-runs / --no-log-runs` - Log run data (default: enabled)
 
@@ -83,10 +81,8 @@ upskill generate "add more error handling examples" --from ./skills/api-errors/
 # Generate from an agent trace file (auto-detected as file)
 upskill generate "document the pattern" --from ./trace.json
 
-# Evaluate on local model (llama.cpp server)
-upskill generate "parse YAML" \
-    --eval-model "unsloth/GLM-4.7-Flash-GGUF:Q4_0" \
-    --eval-base-url http://localhost:8080/v1
+# Skip evaluation during generation (evaluate separately with upskill eval)
+upskill generate "parse YAML" --no-eval
 ```
 
 **Output:**
