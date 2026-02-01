@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -1115,6 +1116,55 @@ def list_cmd(skills_dir: str | None, verbose: bool):
     console.print(tree)
     console.print()
     console.print(f"[dim]{len(skills)} skills, ~{total_tokens:,} total tokens[/dim]")
+
+
+@main.command("delete")
+@click.argument("skill_name")
+@click.option("-d", "--dir", "skills_dir", type=click.Path(), help="Skills directory")
+@click.option("--force", is_flag=True, help="Delete without confirmation")
+def delete_cmd(skill_name: str, skills_dir: str | None, force: bool):
+    """Delete a generated skill directory safely.
+
+    Examples:
+
+        upskill delete git-commit-messages
+
+        upskill delete my-skill --force
+    """
+    config = Config.load()
+    base_dir = Path(skills_dir) if skills_dir else config.skills_dir
+
+    # Safety guard: only allow deleting a single skill directory name
+    if Path(skill_name).name != skill_name or skill_name in {".", ".."}:
+        console.print("[red]Skill name must be a directory name, not a path.[/red]")
+        sys.exit(1)
+
+    skill_path = (base_dir / skill_name).resolve()
+    if not skill_path.is_relative_to(base_dir.resolve()):
+        console.print("[red]Refusing to delete outside the skills directory.[/red]")
+        sys.exit(1)
+
+    if not skill_path.exists():
+        console.print(f"[red]Skill not found: {skill_path}[/red]")
+        sys.exit(1)
+    if not skill_path.is_dir():
+        console.print(f"[red]Not a directory: {skill_path}[/red]")
+        sys.exit(1)
+    if not (skill_path / "SKILL.md").exists():
+        console.print(
+            f"[red]{skill_path} does not look like a skill directory (missing SKILL.md).[/red]"
+        )
+        sys.exit(1)
+
+    if not force:
+        click.confirm(
+            f"Delete skill '{skill_name}' at {skill_path}?",
+            default=False,
+            abort=True,
+        )
+
+    shutil.rmtree(skill_path)
+    console.print(f"[green]Deleted skill:[/green] {skill_path}")
 
 
 @main.command("benchmark")
