@@ -158,6 +158,11 @@ upskill eval ./skills/my-skill/ \
     -m "unsloth/GLM-4.7-Flash-GGUF:Q4_0" \
     --base-url http://localhost:8080/v1
 
+# Evaluate on local model (LM Studio server)
+upskill eval ./skills/your-skill/ \
+    --base-url http://127.0.0.1:1234/v1 \
+    --model "generic.qwen2.5-7b-instruct-1m"
+
 # Skip baseline (just test with skill)
 upskill eval ./skills/my-skill/ --no-baseline
 
@@ -388,7 +393,15 @@ max_refine_attempts: 3          # Refinement iterations
 Place in your project directory to customize FastAgent settings:
 
 ```yaml
+# Model format follows FastAgent provider convention:
+# <provider>.<model_string>.<reasoning_effort?>
+# Examples: anthropic.claude-sonnet-4-20250514, openai.gpt-4.1, generic.llama3.2:latest
 default_model: sonnet
+
+# Generic provider for local OpenAI-compatible endpoints
+generic:
+  api_key: "local"
+  base_url: "${GENERIC_BASE_URL:http://localhost:11434/v1}"
 
 logger:
   progress_display: true
@@ -472,6 +485,8 @@ upskill uses FastAgent model format:
 <provider>.<model>.<reasoning_effort?>
 ```
 
+This provider-prefix convention comes from FastAgent LLM providers docs (`https://fast-agent.ai/models/llm_providers/`) and is the canonical format. Use provider-prefixed model names explicitly, especially for local models.
+
 **Examples:**
 - `sonnet` - Anthropic Claude Sonnet (alias)
 - `haiku` - Anthropic Claude Haiku (alias)
@@ -486,6 +501,15 @@ upskill uses FastAgent model format:
 
 upskill supports local models through any OpenAI-compatible endpoint (Ollama, llama.cpp, vLLM, etc.).
 
+**With LM Studio (OpenAI-compatible server):**
+
+```bash
+# In LM Studio, start the local server (default port 1234), then run:
+upskill eval ./skills/your-skill/ \
+    --base-url http://127.0.0.1:1234/v1 \
+    --model "generic.qwen2.5-7b-instruct-1m"
+```
+
 **Quick start with Ollama:**
 
 ```bash
@@ -494,7 +518,7 @@ ollama serve
 
 # Evaluate with a local model
 upskill eval ./skills/my-skill/ \
-    --model llama3.2:latest \
+    --model generic.llama3.2:latest \
     --base-url http://localhost:11434/v1
 ```
 
@@ -506,7 +530,7 @@ upskill eval ./skills/my-skill/ \
 
 # Evaluate with the local model
 upskill eval ./skills/my-skill/ \
-    --model my-model \
+    --model generic.my-model \
     --base-url http://localhost:8080/v1
 ```
 

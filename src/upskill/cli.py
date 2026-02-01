@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -47,7 +48,10 @@ console = Console()
 
 
 @asynccontextmanager
-async def _fast_agent_context() -> AsyncIterator[object]:
+async def _fast_agent_context(base_url: str | None = None) -> AsyncIterator[object]:
+    if base_url:
+        os.environ["GENERIC_BASE_URL"] = base_url
+
     fast = FastAgent(
         "upskill",
         ignore_unknown_args=True,
@@ -721,7 +725,7 @@ async def _eval_async(
 
     is_benchmark_mode = len(models) > 1 or num_runs > 1
 
-    async with _fast_agent_context() as agent:
+    async with _fast_agent_context(base_url=base_url) as agent:
         # Load test cases
         test_cases: list[TestCase] = []
         if tests:
@@ -812,6 +816,7 @@ async def _eval_async(
                                 tc,
                                 evaluator=agent.evaluator,
                                 skill=skill,
+                                model=model,
                             )
                         except Exception as e:
                             console.print(f"  [red]Test error: {e}[/red]")
@@ -1222,6 +1227,7 @@ async def _benchmark_async(
                             tc,
                             evaluator=agent.evaluator,
                             skill=skill,
+                            model=model,
                         )
                     except Exception as e:
                         console.print(f"  [red]Test error: {e}[/red]")

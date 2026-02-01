@@ -12,7 +12,7 @@ default_model: kimi
 # Override with GENERIC_BASE_URL and GENERIC_API_KEY environment variables
 generic:
   api_key: "local"
-  base_url: "http://localhost:11434/v1"
+  base_url: "${GENERIC_BASE_URL:http://localhost:11434/v1}"
 
 # MCP timeline display settings
 mcp_timeline:
