@@ -2,6 +2,7 @@
 name = "upskill"
 version = "0.2.1"
 description = "Generate and evaluate agent skills"
+readme = "README.md"
 requires-python = ">=3.13.5,<3.14"
 dependencies = [
     "click>=8.1",
@@ -11,6 +12,10 @@ dependencies = [
     "pyyaml>=6.0",
     "rich>=13.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/huggingface/upskill"
+Repository = "https://github.com/huggingface/upskill"
 
 [project.optional-dependencies]
 dev = [
