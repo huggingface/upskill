@@ -18,6 +18,36 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.tree import Tree
 
+# Monkey patch FastAgent to support local models (Ollama)
+# This allows using models like 'llama3.2' without them being in FastAgent's known list
+try:
+    from fast_agent.llm.model_factory import ModelFactory, ModelConfig, Provider, ModelConfigError
+    import os
+
+    # Get the original __func__ to access the unbound classmethod
+    _original_parse_model_string_func = ModelFactory.parse_model_string.__func__
+
+    @classmethod
+    def _patched_parse_model_string(cls, model_string: str, aliases: dict[str, str] | None = None) -> ModelConfig:
+        try:
+            return _original_parse_model_string_func(cls, model_string, aliases)
+        except ModelConfigError:
+            # Fallback for generic provider if configured via environment
+            # This enables support for local models via Ollama/LM Studio
+            if os.environ.get("GENERIC_BASE_URL"):
+                return ModelConfig(
+                    provider=Provider.GENERIC,
+                    model_name=model_string,
+                )
+            raise
+
+    ModelFactory.parse_model_string = _patched_parse_model_string
+except Exception as e:
+    # Don't crash if patching fails, just print warning
+    import sys
+    print(f"Warning: Failed to patch FastAgent for local model support: {e}", file=sys.stderr)
+
+
 from upskill.config import Config
 from upskill.evaluate import evaluate_skill, get_failure_descriptions
 from upskill.generate import generate_skill, generate_tests, improve_skill, refine_skill
@@ -48,9 +78,14 @@ console = Console()
 
 @asynccontextmanager
 async def _fast_agent_context() -> AsyncIterator[object]:
+    # Try to load skills from ./skills directory
+    skills_dir = Path("./skills")
+    skills_directory = skills_dir if skills_dir.exists() else None
+    
     fast = FastAgent(
         "upskill",
         ignore_unknown_args=True,
+        skills_directory=skills_directory,
     )
 
     @fast.agent()
@@ -184,6 +219,14 @@ def main():
 @click.option("-o", "--output", type=click.Path(), help="Output directory for skill")
 @click.option("--no-eval", is_flag=True, help="Skip eval and refinement")
 @click.option("--eval-model", help="Model to evaluate skill on (different from generation model)")
+@click.option(
+    "--provider",
+    type=click.Choice(["anthropic", "openai", "generic"]),
+    help="API provider (auto-detected as 'generic' when --base-url is provided)",
+)
+@click.option(
+    "--base-url", help="Custom API endpoint for local models (e.g., http://localhost:11434/v1)",
+)
 @click.option("--runs-dir", type=click.Path(), help="Directory for run logs (default: ./runs)")
 @click.option("--log-runs/--no-log-runs", default=True, help="Log run data (default: enabled)")
 def generate(
@@ -195,6 +238,8 @@ def generate(
     output: str | None,
     no_eval: bool,
     eval_model: str | None,
+    provider: str | None,
+    base_url: str | None,
     runs_dir: str | None,
     log_runs: bool,
 ):
@@ -220,10 +265,18 @@ def generate(
 
         upskill generate "extract patterns" --from trace.json
 
-        # Evaluate on a local model (Ollama):
+        # Generate with Ollama (local model):
+
+        upskill generate "parse YAML" --model llama3.2:latest \\
+            --base-url http://localhost:11434/v1
+
+        upskill generate "document code" --model qwen2.5-coder:latest \\
+            --provider generic --base-url http://localhost:11434/v1
+
+        # Evaluate on a different model:
 
         upskill generate "parse YAML" --eval-model llama3.2:latest \\
-            --eval-base-url http://localhost:11434/v1
+            --base-url http://localhost:11434/v1
 
         upskill generate "document code" --no-log-runs
     """
@@ -247,10 +300,13 @@ def generate(
             output,
             no_eval,
             eval_model,
+            provider,
+            base_url,
             runs_dir,
             log_runs,
         )
     )
+
 
 
 async def _generate_async(
@@ -262,13 +318,45 @@ async def _generate_async(
     output: str | None,
     no_eval: bool,
     eval_model: str | None,
+    provider: str | None,
+    base_url: str | None,
     runs_dir: str | None,
     log_runs: bool,
 ):
     """Async implementation of generate command."""
+    import os
+    
     config = Config.load()
     gen_model = model or config.model
 
+    # Configure generic provider for Ollama/local models
+    if base_url:
+        os.environ["GENERIC_BASE_URL"] = base_url
+        # Set a dummy API key if not already set (required by some providers)
+        if "GENERIC_API_KEY" not in os.environ:
+            os.environ["GENERIC_API_KEY"] = "local"
+            
+        # Also set dummy Anthropic key if missing to bypass startup checks
+        # This allows using local models without needing an Anthropic key
+        if "ANTHROPIC_API_KEY" not in os.environ:
+            os.environ["ANTHROPIC_API_KEY"] = "dummy"
+        
+        # Auto-detect provider as generic if base_url is provided
+        if not provider:
+            provider = "generic"
+    
+    # Format model string for FastAgent
+    # For non-generic providers, prepend provider prefix if not already present
+    # For generic provider (local models), DON'T prepend - let the monkey patch handle it
+    if provider and gen_model and provider != "generic":
+        known_providers = ["anthropic", "openai", "generic", "google", "bedrock", "vertex"]
+        has_provider_prefix = any(gen_model.startswith(f"{p}.") for p in known_providers)
+        
+        # Only prepend provider prefix for non-generic providers when it's missing
+        if not has_provider_prefix:
+            gen_model = f"{provider}.{gen_model}"
+    
+    
     # Setup run logging if enabled
     batch_id = None
     batch_folder = None
@@ -306,7 +394,7 @@ async def _generate_async(
                 task=task,
                 examples=examples,
                 generator=agent.skill_gen,
-                model=model,
+                model=gen_model,
             )
         # Improve existing skill
         elif from_skill:
@@ -319,7 +407,7 @@ async def _generate_async(
                 existing_skill,
                 instructions=task,
                 generator=agent.skill_gen,
-                model=model,
+                model=gen_model,
             )
         else:
             console.print(f"Generating skill with {gen_model}...", style="dim")
@@ -327,14 +415,14 @@ async def _generate_async(
                 task=task,
                 examples=examples,
                 generator=agent.skill_gen,
-                model=model,
+                model=gen_model,
             )
         if no_eval:
             _save_and_display(skill, output, config)
             return
 
         console.print("Generating test cases...", style="dim")
-        test_cases = await generate_tests(task, generator=agent.test_gen, model=model)
+        test_cases = await generate_tests(task, generator=agent.test_gen, model=gen_model)
 
         # Eval loop with refinement (on generation model)
         prev_success_rate = 0.0
@@ -435,13 +523,22 @@ async def _generate_async(
                     skill,
                     failures,
                     generator=agent.skill_gen,
-                    model=model,
+                    model=gen_model,
                 )
 
         # If eval_model specified, also eval on that model
         eval_results = None
         if eval_model:
-            console.print(f"Evaluating on {eval_model}...", style="dim")
+            # Format eval_model with provider prefix if needed (skip for generic provider)
+            formatted_eval_model = eval_model
+            if provider and provider != "generic":
+                known_providers = ["anthropic", "openai", "generic", "google", "bedrock", "vertex"]
+                has_provider_prefix = any(eval_model.startswith(f"{p}.") for p in known_providers)
+                
+                if not has_provider_prefix:
+                    formatted_eval_model = f"{provider}.{eval_model}"
+            
+            console.print(f"Evaluating on {formatted_eval_model}...", style="dim")
 
             # Create run folder for eval model
             run_folder = None
@@ -462,7 +559,7 @@ async def _generate_async(
                 skill,
                 test_cases,
                 evaluator=agent.evaluator,
-                model=eval_model,
+                model=formatted_eval_model,
             )
 
             # Log eval run results (both baseline and with-skill)
@@ -704,10 +801,27 @@ async def _eval_async(
     runs_dir: str | None,
 ):
     """Async implementation of eval command."""
+    import os
     from upskill.evaluate import run_test
 
     config = Config.load()
     skill_dir = Path(skill_path)
+    
+    # Configure generic provider for Ollama/local models
+    if base_url:
+        os.environ["GENERIC_BASE_URL"] = base_url
+        # Set a dummy API key if not already set (required by some providers)
+        if "GENERIC_API_KEY" not in os.environ:
+            os.environ["GENERIC_API_KEY"] = "local"
+            
+        # Also set dummy Anthropic key if missing to bypass startup checks
+        # This allows using local models without needing an Anthropic key
+        if "ANTHROPIC_API_KEY" not in os.environ:
+            os.environ["ANTHROPIC_API_KEY"] = "dummy"
+        
+        # Auto-detect provider as generic if base_url is provided
+        if not provider:
+            provider = "generic"
 
     try:
         skill = Skill.load(skill_dir)
@@ -718,6 +832,22 @@ async def _eval_async(
     # Use default model if none specified
     if not models:
         models = [config.effective_eval_model]
+    
+    # Format model strings for FastAgent if provider is specified
+    # This must happen AFTER models is set to default if None
+    # For generic provider, DON'T prepend prefix - the monkey patch handles it
+    if models and provider and provider != "generic":
+        formatted_models = []
+        for model in models:
+            known_providers = ["anthropic", "openai", "generic", "google", "bedrock", "vertex"]
+            has_provider_prefix = any(model.startswith(f"{p}.") for p in known_providers)
+            
+            # Only prepend provider prefix if not already present
+            if not has_provider_prefix:
+                formatted_models.append(f"{provider}.{model}")
+            else:
+                formatted_models.append(model)
+        models = formatted_models
 
     is_benchmark_mode = len(models) > 1 or num_runs > 1
 

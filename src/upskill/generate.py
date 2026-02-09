@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 
+from fast_agent.agents.llm_agent import LlmAgent
 from fast_agent.interfaces import AgentProtocol
+from fast_agent.llm.request_params import RequestParams
 from fast_agent.skills.registry import SkillManifest
 
 from upskill.manifest_utils import parse_skill_manifest_text
@@ -109,14 +112,31 @@ async def generate_skill(
 ) -> Skill:
     """Generate a skill from a task description using FastAgent."""
 
-    prompt = f"Create a skill document that teaches an AI agent how to: {task}"
+    prompt = f"Task: {task}\n\nOutput ONLY the complete skill document with YAML frontmatter and markdown body. Do NOT explain or describe what the document should contain - OUTPUT THE ACTUAL DOCUMENT DIRECTLY."
     if examples:
         prompt += "\n\nExample input/output pairs for this task:\n" + "\n".join(
             f"- {ex}" for ex in examples
         )
 
 
-    skill_text = await generator.send(prompt)
+    # Pass model to FastAgent if specified
+    request_params = RequestParams(model=model) if model else None
+    skill_text = await generator.send(prompt, request_params=request_params)
+    
+    # Strip markdown code fences if present (common with smaller models)
+    skill_text = skill_text.strip()
+    
+    # Check if wrapped in code fences (```...```)
+    if skill_text.startswith("```"):
+        lines = skill_text.split("\n")
+        # Remove opening fence (could be ```markdown, ```yaml, or just ```)
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        # Remove closing fence (and any trailing empty lines)
+        while lines and (lines[-1].strip() == "```" or lines[-1].strip() == ""):
+            lines = lines[:-1]
+        skill_text = "\n".join(lines).strip()
+    
     manifest, error = parse_skill_manifest_text(skill_text)
     if manifest is None:
         raise ValueError(f"Skill generator did not return valid SKILL.md: {error}")
@@ -137,7 +157,9 @@ async def generate_tests(
 
     prompt = TEST_GENERATION_PROMPT.replace(TASK_PLACEHOLDER, task)
 
-    result, _ = await generator.structured(prompt, TestCaseSuite)
+    # Pass model to FastAgent if specified
+    request_params = RequestParams(model=model) if model else None
+    result, _ = await generator.structured(prompt, TestCaseSuite, request_params=request_params)
     if result is None:
         raise ValueError("Test generator did not return structured test cases.")
 
@@ -182,7 +204,9 @@ Output a complete SKILL.md document with YAML frontmatter (name, description) an
 Do not wrap the output in code fences.
 """
 
-    skill_text = await generator.send(prompt)
+    # Pass model to FastAgent if specified
+    request_params = RequestParams(model=model) if model else None
+    skill_text = await generator.send(prompt, request_params=request_params)
     manifest, error = parse_skill_manifest_text(skill_text)
     if manifest is None:
         raise ValueError(f"Skill refinement did not return valid SKILL.md: {error}")
@@ -252,7 +276,9 @@ async def improve_skill(
     )
 
 
-    skill_text = await generator.send(prompt)
+    # Pass model to FastAgent if specified
+    request_params = RequestParams(model=model) if model else None
+    skill_text = await generator.send(prompt, request_params=request_params)
     manifest, error = parse_skill_manifest_text(skill_text)
     if manifest is None:
         raise ValueError(f"Skill improvement did not return valid SKILL.md: {error}")

@@ -6,6 +6,8 @@ You generate "skills" - instruction documents that teach AI coding agents how to
 
 When given a task description, create a skill document with clear instructions, examples, and best practices that will help an AI agent complete that type of task reliably.
 
+{{agentSkills}}
+
 ## Example 1: Git Commit Skill
 
 Task: "Write good git commit messages"
