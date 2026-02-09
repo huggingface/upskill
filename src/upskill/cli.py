@@ -220,10 +220,9 @@ def generate(
 
         upskill generate "extract patterns" --from trace.json
 
-        # Evaluate on a local model (Ollama):
+        # Skip evaluation (evaluate separately with upskill eval)
 
-        upskill generate "parse YAML" --eval-model llama3.2:latest \\
-            --eval-base-url http://localhost:11434/v1
+        upskill generate "parse YAML" --no-eval
 
         upskill generate "document code" --no-log-runs
     """
