@@ -45,12 +45,31 @@ load_dotenv()
 
 console = Console()
 
+KNOWN_PROVIDERS = ("anthropic", "openai", "generic")
+
+
+def _model_has_provider(model: str) -> bool:
+    return any(model.startswith(f"{provider}.") for provider in KNOWN_PROVIDERS)
+
+
+def _apply_provider_to_models(models: list[str], provider: str | None) -> list[str]:
+    if not provider:
+        return models
+    normalized: list[str] = []
+    for model in models:
+        if _model_has_provider(model):
+            normalized.append(model)
+        else:
+            normalized.append(f"{provider}.{model}")
+    return normalized
+
 
 @asynccontextmanager
 async def _fast_agent_context() -> AsyncIterator[object]:
     fast = FastAgent(
         "upskill",
         ignore_unknown_args=True,
+        parse_cli_args=False,  # Prevent FastAgent from consuming upskill CLI flags (e.g. -m).
     )
 
     @fast.agent()
@@ -717,6 +736,8 @@ async def _eval_async(
     # Use default model if none specified
     if not models:
         models = [config.effective_eval_model]
+
+    models = _apply_provider_to_models(models, provider)
 
     is_benchmark_mode = len(models) > 1 or num_runs > 1
 
