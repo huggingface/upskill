@@ -121,8 +121,6 @@ upskill eval SKILL_PATH [OPTIONS]
 - `-t, --tests PATH` - Test cases JSON file
 - `-m, --model MODEL` - Model(s) to evaluate against (repeatable for multi-model benchmarking)
 - `--runs N` - Number of runs per model (default: 1)
-- `--provider [anthropic|openai|generic]` - API provider (auto-detected as 'generic' when --base-url is provided)
-- `--base-url URL` - Custom API endpoint for local models
 - `--no-baseline` - Skip baseline comparison
 - `-v, --verbose` - Show per-test results
 - `--log-runs / --no-log-runs` - Log run data (default: enabled)
@@ -149,10 +147,8 @@ upskill eval ./skills/my-skill/ -m haiku -m sonnet
 # Multiple runs per model for statistical significance
 upskill eval ./skills/my-skill/ -m haiku -m sonnet --runs 5
 
-# Evaluate on local model (llama.cpp server)
-upskill eval ./skills/my-skill/ \
-    -m "unsloth/GLM-4.7-Flash-GGUF:Q4_0" \
-    --base-url http://localhost:8080/v1
+# Evaluate a local model configured in fast-agent
+upskill eval ./skills/my-skill/ -m generic.my-model
 
 # Skip baseline (just test with skill)
 upskill eval ./skills/my-skill/ --no-baseline
@@ -369,7 +365,7 @@ Disable with `--no-log-runs`.
 
 ## Configuration
 
-### upskill config (`~/.config/upskill/config.yaml`)
+### upskill config (`./upskill.config.yaml`)
 
 ```yaml
 model: sonnet                    # Default generation model
@@ -378,6 +374,12 @@ skills_dir: ./skills            # Where to save skills
 runs_dir: ./runs                # Where to save run logs
 max_refine_attempts: 3          # Refinement iterations
 ```
+
+Config lookup order:
+
+1. `UPSKILL_CONFIG` environment variable (path)
+2. `./upskill.config.yaml` (project local)
+3. `~/.config/upskill/config.yaml` (legacy fallback)
 
 ### FastAgent config (`fastagent.config.yaml`)
 
@@ -488,10 +490,8 @@ upskill supports local models through any OpenAI-compatible endpoint (Ollama, ll
 # Start Ollama (default port 11434)
 ollama serve
 
-# Evaluate with a local model
-upskill eval ./skills/my-skill/ \
-    --model llama3.2:latest \
-    --base-url http://localhost:11434/v1
+# Configure endpoint via fast-agent config/env, then evaluate
+upskill eval ./skills/my-skill/ --model generic.llama3.2:latest
 ```
 
 **With llama.cpp server:**
@@ -500,10 +500,6 @@ upskill eval ./skills/my-skill/ \
 # Start llama.cpp server
 ./llama-server -m model.gguf --port 8080
 
-# Evaluate with the local model
-upskill eval ./skills/my-skill/ \
-    --model my-model \
-    --base-url http://localhost:8080/v1
+# Configure endpoint via fast-agent config/env, then evaluate
+upskill eval ./skills/my-skill/ --model generic.my-model
 ```
-
-When `--base-url` is provided, the provider is automatically set to `generic` unless you specify `--provider` explicitly.

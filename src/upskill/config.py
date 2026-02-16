@@ -2,15 +2,55 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, Field
 
+UPSKILL_CONFIG_FILE = "upskill.config.yaml"
+LEGACY_CONFIG_FILE = "config.yaml"
+UPSKILL_CONFIG_ENV = "UPSKILL_CONFIG"
+
 
 def get_config_dir() -> Path:
     """Get the upskill config directory."""
     return Path.home() / ".config" / "upskill"
+
+
+def get_local_config_path() -> Path:
+    """Get the project-local upskill config path."""
+    return Path.cwd() / UPSKILL_CONFIG_FILE
+
+
+def get_legacy_config_path() -> Path:
+    """Get the legacy user-level upskill config path."""
+    return get_config_dir() / LEGACY_CONFIG_FILE
+
+
+def find_upskill_config_path() -> Path | None:
+    """Find upskill config path in priority order.
+
+    Priority:
+      1. UPSKILL_CONFIG env var
+      2. ./upskill.config.yaml (project local)
+      3. ~/.config/upskill/config.yaml (legacy)
+    """
+    config_override = os.getenv(UPSKILL_CONFIG_ENV)
+    if config_override:
+        override_path = Path(config_override).expanduser()
+        if override_path.exists():
+            return override_path
+
+    local_config = get_local_config_path()
+    if local_config.exists():
+        return local_config
+
+    legacy_config = get_legacy_config_path()
+    if legacy_config.exists():
+        return legacy_config
+
+    return None
 
 
 def get_default_skills_dir() -> Path:
@@ -60,7 +100,10 @@ class Config(BaseModel):
     @classmethod
     def load(cls) -> Config:
         """Load config from file, or return defaults."""
-        config_path = get_config_dir() / "config.yaml"
+        config_path = find_upskill_config_path()
+        if config_path is None:
+            return cls()
+
         if config_path.exists():
             with open(config_path) as f:
                 data = yaml.safe_load(f) or {}
@@ -72,13 +115,14 @@ class Config(BaseModel):
             if "fastagent_config" in data and isinstance(data["fastagent_config"], str):
                 data["fastagent_config"] = Path(data["fastagent_config"])
             return cls(**data)
+
         return cls()
 
     def save(self) -> None:
         """Save config to file."""
-        config_dir = get_config_dir()
-        config_dir.mkdir(parents=True, exist_ok=True)
-        config_path = config_dir / "config.yaml"
+        config_path = find_upskill_config_path() or get_local_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+
         data = self.model_dump(mode="json")
         # Convert Path objects to strings for YAML
         data["skills_dir"] = str(self.skills_dir)

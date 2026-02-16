@@ -1,0 +1,17 @@
+# upskill project configuration
+
+# Default model for skill generation.
+model: sonnet
+
+# Optional separate model for evaluation. If omitted, uses `model`.
+# eval_model: haiku
+
+# Output directories.
+skills_dir: ./skills
+runs_dir: ./runs
+
+# Number of refinement passes during `upskill generate`.
+max_refine_attempts: 2
+
+# Optional override for fast-agent config file.
+# fastagent_config: ./fastagent.config.yaml

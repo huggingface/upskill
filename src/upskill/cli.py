@@ -47,10 +47,13 @@ console = Console()
 
 
 @asynccontextmanager
-async def _fast_agent_context() -> AsyncIterator[object]:
+async def _fast_agent_context(config: Config | None = None) -> AsyncIterator[object]:
+    config = config or Config.load()
     fast = FastAgent(
         "upskill",
+        config_path=str(config.effective_fastagent_config),
         ignore_unknown_args=True,
+        parse_cli_args=False,
     )
 
     @fast.agent()
@@ -279,7 +282,7 @@ async def _generate_async(
         console.print(f"Logging runs to: {batch_folder}", style="dim")
 
 
-    async with _fast_agent_context() as agent:
+    async with _fast_agent_context(config) as agent:
 
         # Generate from trace file
         if from_trace:
@@ -624,14 +627,6 @@ def _save_and_display(
     "-m", "--model", "models", multiple=True, help="Model(s) to evaluate (repeatable)"
 )
 @click.option("--runs", "num_runs", type=int, default=1, help="Number of runs per model")
-@click.option(
-    "--provider",
-    type=click.Choice(["anthropic", "openai", "generic"]),
-    help="API provider (auto-detected as 'generic' when --base-url is provided)",
-)
-@click.option(
-    "--base-url", help="Custom API endpoint for local models (e.g., http://localhost:8080/v1)"
-)
 @click.option("--no-baseline", is_flag=True, help="Skip baseline comparison")
 @click.option("-v", "--verbose", is_flag=True, help="Show per-test results")
 @click.option("--log-runs/--no-log-runs", default=True, help="Log run data (default: enabled)")
@@ -641,8 +636,6 @@ def eval_cmd(
     tests: str | None,
     models: tuple[str, ...],
     num_runs: int,
-    provider: str | None,
-    base_url: str | None,
     no_baseline: bool,
     verbose: bool,
     log_runs: bool,
@@ -662,15 +655,9 @@ def eval_cmd(
 
         upskill eval ./skills/my-skill/ -m haiku --runs 5
 
-        # Local model with llama.cpp server:
+        # Evaluate local models configured in fast-agent
 
-        upskill eval ./skills/my-skill/ -m my-model \\
-            --base-url http://localhost:8080/v1
-
-        # Local model with Ollama:
-
-        upskill eval ./skills/my-skill/ -m llama3.2:latest \\
-            --base-url http://localhost:11434/v1
+        upskill eval ./skills/my-skill/ -m generic.llama3.2:latest
 
         upskill eval ./skills/my-skill/ --no-log-runs
     """
@@ -680,8 +667,6 @@ def eval_cmd(
             tests,
             list(models) if models else None,
             num_runs,
-            provider,
-            base_url,
             no_baseline,
             verbose,
             log_runs,
@@ -695,8 +680,6 @@ async def _eval_async(
     tests: str | None,
     models: list[str] | None,
     num_runs: int,
-    provider: str | None,
-    base_url: str | None,
     no_baseline: bool,
     verbose: bool,
     log_runs: bool,
@@ -720,7 +703,7 @@ async def _eval_async(
 
     is_benchmark_mode = len(models) > 1 or num_runs > 1
 
-    async with _fast_agent_context() as agent:
+    async with _fast_agent_context(config) as agent:
         # Load test cases
         test_cases: list[TestCase] = []
         if tests:
@@ -764,12 +747,6 @@ async def _eval_async(
             batch_id, batch_folder = create_batch_folder(runs_path)
             console.print(f"Logging to: {batch_folder}", style="dim")
 
-        provider_info = ""
-        if provider:
-            provider_info += f" via {provider}"
-        if base_url:
-            provider_info += f" @ {base_url}"
-
         if is_benchmark_mode:
             # Benchmark mode: multiple models and/or runs
             console.print(
@@ -777,7 +754,7 @@ async def _eval_async(
             )
             console.print(
                 f"  {len(test_cases)} test case(s), "
-                f"{num_runs} run(s) per model{provider_info}\n"
+                f"{num_runs} run(s) per model\n"
             )
 
             model_results: dict[str, list[RunResult]] = {m: [] for m in models}
@@ -916,7 +893,7 @@ async def _eval_async(
         else:
             # Simple eval mode: single model, single run
             model = models[0]
-            console.print(f"Running {len(test_cases)} test cases{provider_info}...", style="dim")
+            console.print(f"Running {len(test_cases)} test cases...", style="dim")
 
             results = await evaluate_skill(
                 skill,
@@ -1166,7 +1143,7 @@ async def _benchmark_async(
     config = Config.load()
     skill = Skill.load(Path(skill_path))
 
-    async with _fast_agent_context() as agent:
+    async with _fast_agent_context(config) as agent:
         # Load test cases
         if tests_path:
             with open(tests_path, encoding="utf-8") as f:
