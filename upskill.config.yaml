@@ -1,10 +1,13 @@
 # upskill project configuration
 
 # Default model for skill generation.
-model: sonnet
+skill_generation_model: sonnet
 
-# Optional separate model for evaluation. If omitted, uses `model`.
+# Optional separate model for evaluation. If omitted, uses `skill_generation_model`.
 # eval_model: haiku
+
+# Optional model for test generation. If omitted, uses `skill_generation_model`.
+# test_gen_model: haiku
 
 # Output directories.
 skills_dir: ./skills
