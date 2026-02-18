@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13.5,<3.14"
 dependencies = [
     "click>=8.1",
-    "fast-agent-mcp>=0.4.41",
+    "fast-agent-mcp>=0.4.53",
     "pydantic>=2.0",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",

@@ -42,6 +42,31 @@ View the results later.
 upskill runs --skill git-commit-messages
 ```
 
+## Model Handling Overview
+
+upskill uses distinct phases with explicit model roles:
+
+- **Skill generation**: create/refine `SKILL.md`
+- **Test generation**: create synthetic evaluation cases
+- **Evaluation**: run tests against evaluator model(s)
+- **Benchmark**: repeated evaluation across multiple runs/models
+
+Model flags by command:
+
+| Command | Flag | Meaning |
+|---|---|---|
+| `generate` | `--model` | Skill generation/refinement model |
+| `generate` | `--test-gen-model` | Test generation model override |
+| `generate` | `--eval-model` | Optional extra cross-model eval pass |
+| `eval` | `-m/--model` | Evaluation model(s) (repeatable) |
+| `eval` | `--test-gen-model` | Test generation model override (when tests are generated) |
+| `benchmark` | `-m/--model` | Evaluation model(s) to benchmark |
+| `benchmark` | `--test-gen-model` | Test generation model override (when tests are generated) |
+| `runs` / `plot` | `-m/--model` | Historical results filter only |
+
+`upskill eval` enters **benchmark mode** whenever you pass multiple `-m` values or `--runs > 1`.
+In benchmark mode, baseline comparison is always off; `--no-baseline` is redundant.
+
 ## Commands
 
 ### `upskill generate`
@@ -59,7 +84,8 @@ upskill generate TASK [OPTIONS]
 - `-e, --example` - Input -> output example (can be repeated)
 - `--tool` - Generate from MCP tool schema (path#tool_name)
 - `-f, --from PATH` - Improve from existing skill dir or agent trace file (auto-detected)
-- `-m, --model MODEL` - Model for generation (e.g., 'sonnet', 'haiku', 'anthropic.claude-sonnet-4-20250514')
+- `-m, --model MODEL` - Skill generation model (e.g., 'sonnet', 'haiku', 'anthropic.claude-sonnet-4-20250514')
+- `--test-gen-model MODEL` - Override test generation model for this run
 - `-o, --output PATH` - Output directory for skill
 - `--no-eval` - Skip evaluation and refinement
 - `--eval-model MODEL` - Different model to evaluate skill on
@@ -120,8 +146,9 @@ upskill eval SKILL_PATH [OPTIONS]
 **Options:**
 - `-t, --tests PATH` - Test cases JSON file
 - `-m, --model MODEL` - Model(s) to evaluate against (repeatable for multi-model benchmarking)
+- `--test-gen-model MODEL` - Override test generation model when tests must be generated
 - `--runs N` - Number of runs per model (default: 1)
-- `--no-baseline` - Skip baseline comparison
+- `--no-baseline` - Skip baseline comparison (simple eval mode only; ignored in benchmark mode)
 - `-v, --verbose` - Show per-test results
 - `--log-runs / --no-log-runs` - Log run data (default: enabled)
 - `--runs-dir PATH` - Directory for run logs
@@ -152,6 +179,9 @@ upskill eval ./skills/my-skill/ -m generic.my-model
 
 # Skip baseline (just test with skill)
 upskill eval ./skills/my-skill/ --no-baseline
+
+# Benchmark mode is triggered by multiple models OR --runs > 1
+upskill eval ./skills/my-skill/ -m haiku --runs 5
 
 # Disable run logging
 upskill eval ./skills/my-skill/ --no-log-runs
@@ -242,7 +272,7 @@ upskill runs [OPTIONS]
 **Options:**
 - `-d, --dir PATH` - Runs directory
 - `-s, --skill TEXT` - Filter by skill name(s) (repeatable)
-- `-m, --model TEXT` - Filter by model(s) (repeatable)
+- `-m, --model TEXT` - Filter historical run data by model(s) (repeatable)
 - `--metric [success|tokens]` - Metric to display (default: success)
 - `--csv PATH` - Export to CSV instead of plot
 
@@ -368,12 +398,24 @@ Disable with `--no-log-runs`.
 ### upskill config (`./upskill.config.yaml`)
 
 ```yaml
-model: sonnet                    # Default generation model
+skill_generation_model: sonnet   # Default skill generation model
 eval_model: haiku               # Default evaluation model (optional)
+test_gen_model: null            # Optional test generation model
 skills_dir: ./skills            # Where to save skills
 runs_dir: ./runs                # Where to save run logs
 max_refine_attempts: 3          # Refinement iterations
 ```
+
+`test_gen_model` fallback behavior:
+
+- CLI `--test-gen-model` overrides config for a single run.
+- If set, test generation uses `test_gen_model`.
+- If unset, test generation falls back to `skill_generation_model`.
+- For `eval`/`benchmark`, this intentionally uses `skill_generation_model` (not `eval_model`) so generated tests stay
+  stable when sweeping multiple evaluation models.
+
+Backward compatibility: `model` is still accepted in config files as a legacy alias for
+`skill_generation_model`.
 
 Config lookup order:
 

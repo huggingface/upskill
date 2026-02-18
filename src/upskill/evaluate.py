@@ -7,11 +7,16 @@ import logging
 import shutil
 import tempfile
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 from fast_agent import ConversationSummary
 from fast_agent.agents.llm_agent import LlmAgent
+
+try:
+    from fast_agent.ui.rich_progress import progress_display
+except Exception:  # pragma: no cover - defensive import for older fast-agent versions
+    progress_display = None
 
 from upskill.fastagent_integration import (
     compose_instruction,
@@ -27,6 +32,20 @@ from upskill.models import (
     ValidationResult,
 )
 from upskill.validators import get_validator
+
+
+def _hide_progress_task(task_name: str | None) -> None:
+    """Best-effort hide of a completed task from the shared progress display."""
+    if not task_name or progress_display is None:
+        return
+    hide_task = getattr(progress_display, "hide_task", None)
+    if not callable(hide_task):
+        return
+    try:
+        hide_task(task_name)
+    except Exception:
+        # Progress cleanup is best-effort and should never fail evaluations.
+        return
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +190,7 @@ async def _run_test_with_evaluator(
                     await clone.shutdown()
                 except Exception as exc:
                     logger.exception("Failed to shutdown evaluator clone", exc_info=exc)
+            _hide_progress_task(instance_name)
 
     if needs_workspace:
         with isolated_workspace() as workspace:
@@ -184,6 +204,7 @@ async def run_test(
     skill: Skill | None,
     use_workspace: bool | None = None,
     model: str | None = None,
+    instance_name: str | None = None,
 ) -> TestResult:
     """Run a single test case using an evaluator agent.
 
@@ -192,6 +213,8 @@ async def run_test(
         evaluator: Evaluator agent to run the test case
         skill: Optional skill to inject (None for baseline)
         use_workspace: Force workspace isolation (auto-detected from test_case.validator)
+        model: Model to evaluate with for this test case
+        instance_name: Optional evaluator instance display name
     """
 
     try:
@@ -203,6 +226,7 @@ async def run_test(
             evaluator,
             instruction,
             use_workspace=use_workspace,
+            instance_name=instance_name,
         )
     except Exception as exc:
         return TestResult(test_case=test_case, success=False, error=str(exc))
@@ -214,6 +238,7 @@ async def evaluate_skill(
     evaluator: LlmAgent,
     model: str | None = None,
     run_baseline: bool = True,
+    show_baseline_progress: bool = False,
 ) -> EvalResults:
     """Evaluate a skill against test cases using FastAgent.
 
@@ -223,6 +248,7 @@ async def evaluate_skill(
         evaluator: Evaluator agent to run the test cases
         model: Model to evaluate on (defaults to config.eval_model)
         run_baseline: Whether to also run without the skill
+        show_baseline_progress: Whether to render baseline progress output
 
     Returns:
         EvalResults comparing skill vs baseline
@@ -238,7 +264,7 @@ async def evaluate_skill(
     ) -> list[TestResult]:
         tasks = []
         for index, tc in enumerate(test_cases, start=1):
-            instance_name = f"{evaluator.name}[{label}-{index}]"
+            instance_name = f"eval ({label} test {index})"
             tasks.append(
                 _run_test_with_evaluator(
                     tc,
@@ -254,7 +280,7 @@ async def evaluate_skill(
 
     # Run with skill
     skill_instruction = compose_instruction(base_instruction, skill)
-    results.with_skill_results = await _run_batch(skill_instruction, "skill")
+    results.with_skill_results = await _run_batch(skill_instruction, "with-skill")
 
     # Calculate with-skill metrics
     successes = sum(1 for r in results.with_skill_results if r.success)
@@ -270,7 +296,14 @@ async def evaluate_skill(
 
     # Run baseline if requested
     if run_baseline:
-        results.baseline_results = await _run_batch(None, "baseline")
+        pause_cm = nullcontext()
+        if not show_baseline_progress and progress_display is not None:
+            paused = getattr(progress_display, "paused", None)
+            if callable(paused):
+                pause_cm = paused()
+
+        with pause_cm:
+            results.baseline_results = await _run_batch(None, "baseline")
 
         successes = sum(1 for r in results.baseline_results if r.success)
         results.baseline_success_rate = successes / len(test_cases) if test_cases else 0

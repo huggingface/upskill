@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import sys
 from collections.abc import AsyncIterator
@@ -18,7 +19,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.tree import Tree
 
-from upskill.config import Config
+from upskill.config import Config, resolve_upskill_config_path
 from upskill.evaluate import evaluate_skill, get_failure_descriptions
 from upskill.generate import generate_skill, generate_tests, improve_skill, refine_skill
 from upskill.logging import (
@@ -32,6 +33,7 @@ from upskill.logging import (
     write_run_metadata,
     write_run_result,
 )
+from upskill.model_resolution import ResolvedModels, resolve_models
 from upskill.models import (
     BatchSummary,
     RunMetadata,
@@ -66,6 +68,62 @@ async def _fast_agent_context(config: Config | None = None) -> AsyncIterator[obj
 
     async with fast.run() as agent:
         yield agent
+
+
+async def _set_agent_model(agent: object, model: str | None) -> None:
+    """Best-effort model assignment for a fast-agent instance."""
+    if not model:
+        return
+    set_model = getattr(agent, "set_model", None)
+    if not callable(set_model):
+        return
+    result = set_model(model)
+    if inspect.isawaitable(result):
+        await result
+
+
+def _require_resolved_model(value: str | None, *, field: str, command: str) -> str:
+    """Require a non-null resolved model value for a command."""
+    if value is None:
+        raise RuntimeError(
+            f"Model resolution bug: `{command}` requires resolved `{field}` to be set."
+        )
+    return value
+
+
+def _require_resolved_models(values: list[str], *, field: str, command: str) -> list[str]:
+    """Require a non-empty resolved model list for a command."""
+    if not values:
+        raise RuntimeError(
+            f"Model resolution bug: `{command}` requires resolved `{field}` to be non-empty."
+        )
+    return values
+
+
+def _print_model_plan(command: str, resolved: ResolvedModels, runs: int | None = None) -> None:
+    """Print resolved model plan for command execution."""
+    console.print("[dim]Resolved model plan:[/dim]")
+
+    if command == "generate":
+        console.print(f"  Skill Generation Model: {resolved.skill_generation_model}")
+        console.print(f"  Test Generation Model: {resolved.test_generation_model}")
+        console.print(f"  Evaluation Model (main loop): {resolved.skill_generation_model}")
+        if resolved.extra_eval_model:
+            console.print(f"  Evaluation Model (extra pass): {resolved.extra_eval_model}")
+        return
+
+    if command in {"eval", "benchmark"}:
+        models = ", ".join(resolved.evaluation_models)
+        console.print(f"  Evaluation Model(s): {models}")
+        if runs is not None:
+            console.print(f"  Runs per model: {runs}")
+        baseline_state = "off (benchmark mode)" if resolved.is_benchmark_mode else (
+            "on" if resolved.run_baseline else "off"
+        )
+        console.print(
+            f"  Baseline: {baseline_state}"
+        )
+        console.print(f"  Test Generation Model: {resolved.test_generation_model}")
 
 
 def _render_bar(value: float, width: int = 20) -> str:
@@ -166,6 +224,15 @@ def _load_eval_results(runs_path: Path) -> list[EvalPlotResult]:
 @click.version_option()
 def main():
     """upskill - Generate and evaluate agent skills."""
+    resolution = resolve_upskill_config_path()
+    if resolution.path is None:
+        console.print("[dim]Config source: defaults (no config file found)[/dim]")
+        return
+
+    message = f"[dim]Config source: {resolution.source} ({resolution.path})[/dim]"
+    if not resolution.exists:
+        message += " [yellow](file missing; using defaults until saved)[/yellow]"
+    console.print(message)
 
 
 @main.command()
@@ -182,11 +249,15 @@ def main():
 @click.option(
     "-m",
     "--model",
-    help="Model for generation (e.g., 'sonnet', 'anthropic.claude-sonnet-4-20250514')",
+    help="Skill generation model for skill creation/refinement",
+)
+@click.option(
+    "--test-gen-model",
+    help="Override test generation model for this run",
 )
 @click.option("-o", "--output", type=click.Path(), help="Output directory for skill")
 @click.option("--no-eval", is_flag=True, help="Skip eval and refinement")
-@click.option("--eval-model", help="Model to evaluate skill on (different from generation model)")
+@click.option("--eval-model", help="Optional extra cross-model eval pass after generation")
 @click.option("--runs-dir", type=click.Path(), help="Directory for run logs (default: ./runs)")
 @click.option("--log-runs/--no-log-runs", default=True, help="Log run data (default: enabled)")
 def generate(
@@ -195,6 +266,7 @@ def generate(
     tool: str | None,  # noqa: ARG001
     from_source: str | None,
     model: str | None,
+    test_gen_model: str | None,
     output: str | None,
     no_eval: bool,
     eval_model: str | None,
@@ -208,6 +280,8 @@ def generate(
         upskill generate "parse JSON Schema files"
 
         upskill generate "write git commits" --model sonnet
+
+        upskill generate "write git commits" --model sonnet --test-gen-model opus
 
         upskill generate "handle API errors" --eval-model haiku
 
@@ -246,6 +320,7 @@ def generate(
             from_skill,
             from_trace,
             model,
+            test_gen_model,
             output,
             no_eval,
             eval_model,
@@ -261,6 +336,7 @@ async def _generate_async(
     from_skill: str | None,
     from_trace: str | None,
     model: str | None,
+    test_gen_model: str | None,
     output: str | None,
     no_eval: bool,
     eval_model: str | None,
@@ -269,7 +345,26 @@ async def _generate_async(
 ):
     """Async implementation of generate command."""
     config = Config.load()
-    gen_model = model or config.model
+    resolved = resolve_models(
+        "generate",
+        config=config,
+        cli_model=model,
+        cli_eval_model=eval_model,
+        cli_test_gen_model=test_gen_model,
+    )
+    skill_gen_model = _require_resolved_model(
+        resolved.skill_generation_model,
+        field="skill_generation_model",
+        command="generate",
+    )
+    test_gen_model = _require_resolved_model(
+        resolved.test_generation_model,
+        field="test_generation_model",
+        command="generate",
+    )
+    extra_eval_model = resolved.extra_eval_model
+
+    _print_model_plan("generate", resolved)
 
     # Setup run logging if enabled
     batch_id = None
@@ -281,9 +376,7 @@ async def _generate_async(
         batch_id, batch_folder = create_batch_folder(runs_path)
         console.print(f"Logging runs to: {batch_folder}", style="dim")
 
-
     async with _fast_agent_context(config) as agent:
-
         # Generate from trace file
         if from_trace:
             console.print(f"Generating skill from trace: {from_trace}", style="dim")
@@ -303,47 +396,54 @@ async def _generate_async(
                 trace_context = trace_content[:4000]
 
             task = f"{task}\n\nBased on this agent trace:\n\n{trace_context}"
-            console.print(f"Generating skill with {gen_model}...", style="dim")
+            console.print(f"Generating skill with {skill_gen_model}...", style="dim")
+            await _set_agent_model(agent.skill_gen, skill_gen_model)
             skill = await generate_skill(
                 task=task,
                 examples=examples,
                 generator=agent.skill_gen,
-                model=model,
+                model=skill_gen_model,
             )
         # Improve existing skill
         elif from_skill:
             existing_skill = Skill.load(Path(from_skill))
             console.print(
-                f"Improving [bold]{existing_skill.name}[/bold] with {gen_model}...",
+                f"Improving [bold]{existing_skill.name}[/bold] with {skill_gen_model}...",
                 style="dim",
             )
+            await _set_agent_model(agent.skill_gen, skill_gen_model)
             skill = await improve_skill(
                 existing_skill,
                 instructions=task,
                 generator=agent.skill_gen,
-                model=model,
+                model=skill_gen_model,
             )
         else:
-            console.print(f"Generating skill with {gen_model}...", style="dim")
+            console.print(f"Generating skill with {skill_gen_model}...", style="dim")
+            await _set_agent_model(agent.skill_gen, skill_gen_model)
             skill = await generate_skill(
                 task=task,
                 examples=examples,
                 generator=agent.skill_gen,
-                model=model,
+                model=skill_gen_model,
             )
         if no_eval:
             _save_and_display(skill, output, config)
             return
 
         console.print("Generating test cases...", style="dim")
-        test_cases = await generate_tests(task, generator=agent.test_gen, model=model)
+        await _set_agent_model(agent.test_gen, test_gen_model)
+        test_cases = await generate_tests(task, generator=agent.test_gen, model=test_gen_model)
 
-        # Eval loop with refinement (on generation model)
+        # Eval loop with refinement (on skill generation model)
         prev_success_rate = 0.0
         results = None
         attempts = max(1, config.max_refine_attempts)
         for attempt in range(attempts):
-            console.print(f"Evaluating on {gen_model}... (attempt {attempt + 1})", style="dim")
+            console.print(
+                f"Evaluating on {skill_gen_model}... (attempt {attempt + 1})",
+                style="dim",
+            )
 
             # Create run folder for logging (2 folders per attempt: baseline + with_skill)
             run_folder = None
@@ -353,7 +453,7 @@ async def _generate_async(
                 write_run_metadata(
                     run_folder,
                     RunMetadata(
-                        model=gen_model,
+                        model=skill_gen_model,
                         task=task,
                         batch_id=batch_id or "",
                         run_number=baseline_run_num,
@@ -366,7 +466,8 @@ async def _generate_async(
                 skill,
                 test_cases=test_cases,
                 evaluator=agent.evaluator,
-                model=gen_model,
+                model=skill_gen_model,
+                show_baseline_progress=False,
             )
 
             # Log run results (both baseline and with-skill for plot command)
@@ -374,7 +475,7 @@ async def _generate_async(
                 # Log baseline result
                 baseline_result = RunResult(
                     metadata=RunMetadata(
-                        model=gen_model,
+                        model=skill_gen_model,
                         task=task,
                         batch_id=batch_id or "",
                         run_number=baseline_run_num,
@@ -393,7 +494,7 @@ async def _generate_async(
                 with_skill_folder = create_run_folder(batch_folder, attempt * 2 + 2)
                 with_skill_result = RunResult(
                     metadata=RunMetadata(
-                        model=gen_model,
+                        model=skill_gen_model,
                         task=task,
                         batch_id=batch_id or "",
                         run_number=attempt * 2 + 2,
@@ -433,27 +534,28 @@ async def _generate_async(
             if attempt < attempts - 1:
                 console.print("Refining...", style="dim")
                 failures = get_failure_descriptions(results)
+                await _set_agent_model(agent.skill_gen, skill_gen_model)
                 skill = await refine_skill(
                     skill,
                     failures,
                     generator=agent.skill_gen,
-                    model=model,
+                    model=skill_gen_model,
                 )
 
         # If eval_model specified, also eval on that model
         eval_results = None
-        if eval_model:
-            console.print(f"Evaluating on {eval_model}...", style="dim")
+        if extra_eval_model:
+            console.print(f"Evaluating on {extra_eval_model}...", style="dim")
 
             # Create run folder for eval model
             run_folder = None
             if log_runs and batch_folder:
-                run_number = attempts + 1
+                run_number = len(run_results) + 1
                 run_folder = create_run_folder(batch_folder, run_number)
                 write_run_metadata(
                     run_folder,
                     RunMetadata(
-                        model=eval_model,
+                        model=extra_eval_model,
                         task=task,
                         batch_id=batch_id or "",
                         run_number=run_number,
@@ -464,7 +566,8 @@ async def _generate_async(
                 skill,
                 test_cases,
                 evaluator=agent.evaluator,
-                model=eval_model,
+                model=extra_eval_model,
+                show_baseline_progress=False,
             )
 
             # Log eval run results (both baseline and with-skill)
@@ -472,7 +575,7 @@ async def _generate_async(
                 # Log baseline result
                 baseline_result = RunResult(
                     metadata=RunMetadata(
-                        model=eval_model,
+                        model=extra_eval_model,
                         task=task,
                         batch_id=batch_id or "",
                         run_number=run_number,
@@ -491,7 +594,7 @@ async def _generate_async(
                 with_skill_folder = create_run_folder(batch_folder, run_number + 1)
                 with_skill_result = RunResult(
                     metadata=RunMetadata(
-                        model=eval_model,
+                        model=extra_eval_model,
                         task=task,
                         batch_id=batch_id or "",
                         run_number=run_number + 1,
@@ -518,7 +621,7 @@ async def _generate_async(
         if log_runs and batch_folder and batch_id:
             summary = BatchSummary(
                 batch_id=batch_id,
-                model=gen_model,
+                model=skill_gen_model,
                 task=task,
                 total_runs=len(run_results),
                 passed_runs=sum(1 for r in run_results if r.passed),
@@ -534,7 +637,15 @@ async def _generate_async(
                 "[yellow]No evaluation results available; skipping report output.[/yellow]"
             )
 
-        _save_and_display(skill, output, config, results, eval_results, gen_model, eval_model)
+        _save_and_display(
+            skill,
+            output,
+            config,
+            results,
+            eval_results,
+            skill_gen_model,
+            extra_eval_model,
+        )
 
 
 
@@ -546,7 +657,7 @@ def _save_and_display(
     config: Config,
     results=None,
     eval_results=None,
-    gen_model: str | None = None,
+    skill_gen_model: str | None = None,
     eval_model: str | None = None,
 ):
     """Save skill and display summary."""
@@ -576,7 +687,11 @@ def _save_and_display(
     if results and eval_results:
         # Multiple models - show each with bars
         console.print()
-        for model_name, r in [(gen_model or "gen", results), (eval_model or "eval", eval_results)]:
+        model_rows = [
+            (skill_gen_model or "skill-gen", results),
+            (eval_model or "eval", eval_results),
+        ]
+        for model_name, r in model_rows:
             console.print(f"  [bold]{model_name}[/bold]")
             baseline_bar = _render_bar(r.baseline_success_rate)
             with_skill_bar = _render_bar(r.with_skill_success_rate)
@@ -624,10 +739,22 @@ def _save_and_display(
 @click.argument("skill_path", type=click.Path(exists=True))
 @click.option("-t", "--tests", type=click.Path(exists=True), help="Test cases JSON file")
 @click.option(
-    "-m", "--model", "models", multiple=True, help="Model(s) to evaluate (repeatable)"
+    "-m",
+    "--model",
+    "models",
+    multiple=True,
+    help="Evaluation model(s) to run tests on (repeatable)",
+)
+@click.option(
+    "--test-gen-model",
+    help="Override test generation model when tests must be generated",
 )
 @click.option("--runs", "num_runs", type=int, default=1, help="Number of runs per model")
-@click.option("--no-baseline", is_flag=True, help="Skip baseline comparison")
+@click.option(
+    "--no-baseline",
+    is_flag=True,
+    help="Skip baseline comparison in simple eval mode (ignored in benchmark mode)",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Show per-test results")
 @click.option("--log-runs/--no-log-runs", default=True, help="Log run data (default: enabled)")
 @click.option("--runs-dir", type=click.Path(), help="Directory for run logs")
@@ -635,13 +762,17 @@ def eval_cmd(
     skill_path: str,
     tests: str | None,
     models: tuple[str, ...],
+    test_gen_model: str | None,
     num_runs: int,
     no_baseline: bool,
     verbose: bool,
     log_runs: bool,
     runs_dir: str | None,
 ):
-    """Evaluate a skill (compares with vs without).
+    """Evaluate a skill.
+
+    Uses simple eval mode for one model with ``--runs 1``.
+    Enters benchmark mode when using multiple ``-m`` values or ``--runs > 1``.
 
     Examples:
 
@@ -650,6 +781,8 @@ def eval_cmd(
         upskill eval ./skills/my-skill/ --tests ./tests.json -v
 
         upskill eval ./skills/my-skill/ -m haiku
+
+        upskill eval ./skills/my-skill/ -m haiku --test-gen-model opus
 
         upskill eval ./skills/my-skill/ -m haiku -m sonnet
 
@@ -666,6 +799,7 @@ def eval_cmd(
             skill_path,
             tests,
             list(models) if models else None,
+            test_gen_model,
             num_runs,
             no_baseline,
             verbose,
@@ -679,6 +813,7 @@ async def _eval_async(
     skill_path: str,
     tests: str | None,
     models: list[str] | None,
+    test_gen_model: str | None,
     num_runs: int,
     no_baseline: bool,
     verbose: bool,
@@ -689,6 +824,31 @@ async def _eval_async(
     from upskill.evaluate import run_test
 
     config = Config.load()
+    resolved = resolve_models(
+        "eval",
+        config=config,
+        cli_models=models,
+        cli_test_gen_model=test_gen_model,
+        num_runs=num_runs,
+        no_baseline=no_baseline,
+    )
+    evaluation_models = _require_resolved_models(
+        resolved.evaluation_models,
+        field="evaluation_models",
+        command="eval",
+    )
+    test_gen_model = _require_resolved_model(
+        resolved.test_generation_model,
+        field="test_generation_model",
+        command="eval",
+    )
+
+    _print_model_plan("eval", resolved, runs=num_runs)
+    if resolved.is_benchmark_mode and no_baseline:
+        console.print(
+            "[dim]Note: --no-baseline is redundant in benchmark mode and is ignored.[/dim]"
+        )
+
     skill_dir = Path(skill_path)
 
     try:
@@ -696,12 +856,6 @@ async def _eval_async(
     except FileNotFoundError:
         console.print(f"[red]No SKILL.md found in {skill_dir}[/red]")
         sys.exit(1)
-
-    # Use default model if none specified
-    if not models:
-        models = [config.effective_eval_model]
-
-    is_benchmark_mode = len(models) > 1 or num_runs > 1
 
     async with _fast_agent_context(config) as agent:
         # Load test cases
@@ -719,10 +873,11 @@ async def _eval_async(
             test_source = "skill_meta.json"
         else:
             console.print("Generating test cases from skill...", style="dim")
+            await _set_agent_model(agent.test_gen, test_gen_model)
             test_cases = await generate_tests(
                 skill.description,
                 generator=agent.test_gen,
-                model=models[0],
+                model=test_gen_model,
             )
             test_source = "generated"
 
@@ -747,20 +902,20 @@ async def _eval_async(
             batch_id, batch_folder = create_batch_folder(runs_path)
             console.print(f"Logging to: {batch_folder}", style="dim")
 
-        if is_benchmark_mode:
+        if resolved.is_benchmark_mode:
             # Benchmark mode: multiple models and/or runs
             console.print(
-                f"\nEvaluating [bold]{skill.name}[/bold] across {len(models)} model(s)"
+                f"\nEvaluating [bold]{skill.name}[/bold] across {len(evaluation_models)} model(s)"
             )
             console.print(
                 f"  {len(test_cases)} test case(s), "
                 f"{num_runs} run(s) per model\n"
             )
 
-            model_results: dict[str, list[RunResult]] = {m: [] for m in models}
+            model_results: dict[str, list[RunResult]] = {m: [] for m in evaluation_models}
             all_run_results: list[RunResult] = []
 
-            for model in models:
+            for model in evaluation_models:
                 console.print(f"[bold]{model}[/bold]")
 
                 for run_num in range(1, num_runs + 1):
@@ -788,6 +943,10 @@ async def _eval_async(
                                 tc,
                                 evaluator=agent.evaluator,
                                 skill=skill,
+                                model=model,
+                                instance_name=(
+                                    f"eval ({model} run {run_num} test {tc_idx})"
+                                ),
                             )
                         except Exception as e:
                             console.print(f"  [red]Test error: {e}[/red]")
@@ -882,7 +1041,7 @@ async def _eval_async(
             if log_runs and batch_folder and batch_id:
                 summary = BatchSummary(
                     batch_id=batch_id,
-                    model=", ".join(models),
+                    model=", ".join(evaluation_models),
                     task=skill.description,
                     total_runs=len(all_run_results),
                     passed_runs=sum(1 for r in all_run_results if r.passed),
@@ -892,7 +1051,7 @@ async def _eval_async(
 
         else:
             # Simple eval mode: single model, single run
-            model = models[0]
+            model = evaluation_models[0]
             console.print(f"Running {len(test_cases)} test cases...", style="dim")
 
             results = await evaluate_skill(
@@ -900,14 +1059,15 @@ async def _eval_async(
                 test_cases,
                 evaluator=agent.evaluator,
                 model=model,
-                run_baseline=not no_baseline,
+                run_baseline=resolved.run_baseline,
+                show_baseline_progress=verbose,
             )
 
             # Log results (both baseline and with-skill)
             run_results: list[RunResult] = []
             if log_runs and batch_folder:
                 # Log baseline result
-                if not no_baseline:
+                if resolved.run_baseline:
                     baseline_folder = create_run_folder(batch_folder, 1)
                     baseline_result = RunResult(
                         metadata=RunMetadata(
@@ -928,17 +1088,20 @@ async def _eval_async(
                     run_results.append(baseline_result)
 
                 # Log with-skill result
-                with_skill_folder = create_run_folder(batch_folder, 2 if not no_baseline else 1)
+                with_skill_folder = create_run_folder(
+                    batch_folder,
+                    2 if resolved.run_baseline else 1,
+                )
                 with_skill_result = RunResult(
                     metadata=RunMetadata(
                         model=model,
                         task=skill.description,
                         batch_id=batch_id or "",
-                        run_number=2 if not no_baseline else 1,
+                        run_number=2 if resolved.run_baseline else 1,
                     ),
                     stats=aggregate_conversation_stats(results.with_skill_results),
                     passed=results.is_beneficial
-                    if not no_baseline
+                    if resolved.run_baseline
                     else results.with_skill_success_rate > 0.5,
                     assertions_passed=int(results.with_skill_success_rate * len(test_cases)),
                     assertions_total=len(test_cases),
@@ -960,7 +1123,7 @@ async def _eval_async(
                 )
                 write_batch_summary(batch_folder, summary)
 
-            if verbose and not no_baseline:
+            if verbose and resolved.run_baseline:
                 console.print()
                 for i, (with_r, base_r) in enumerate(
                     zip(results.with_skill_results, results.baseline_results), 1
@@ -973,7 +1136,7 @@ async def _eval_async(
 
             # Display results with horizontal bars
             console.print()
-            if not no_baseline:
+            if resolved.run_baseline:
                 baseline_rate = results.baseline_success_rate
                 with_skill_rate = results.with_skill_success_rate
                 lift = results.skill_lift
@@ -1008,7 +1171,7 @@ async def _eval_async(
                 console.print(f"  with skill {with_skill_bar}  {with_skill_rate:>5.0%}")
                 console.print(f"  tokens: {results.with_skill_total_tokens}")
 
-            if not no_baseline:
+            if resolved.run_baseline:
                 if results.is_beneficial:
                     console.print("\n[green]Recommendation: keep skill[/green]")
                 else:
@@ -1095,9 +1258,20 @@ def list_cmd(skills_dir: str | None, verbose: bool):
 
 @main.command("benchmark")
 @click.argument("skill_path", type=click.Path(exists=True))
-@click.option("-m", "--model", "models", multiple=True, required=True, help="Model to benchmark")
+@click.option(
+    "-m",
+    "--model",
+    "models",
+    multiple=True,
+    required=True,
+    help="Evaluation model(s) to benchmark (repeatable)",
+)
 @click.option("--runs", "num_runs", type=int, default=3, help="Runs per model (default: 3)")
 @click.option("-t", "--tests", type=click.Path(exists=True), help="Test cases JSON file")
+@click.option(
+    "--test-gen-model",
+    help="Override test generation model when tests must be generated",
+)
 @click.option("-o", "--output", type=click.Path(), help="Output directory for results")
 @click.option("-v", "--verbose", is_flag=True, help="Show per-run details")
 def benchmark_cmd(
@@ -1105,6 +1279,7 @@ def benchmark_cmd(
     models: tuple[str, ...],
     num_runs: int,
     tests: str | None,
+    test_gen_model: str | None,
     output: str | None,
     verbose: bool,
 ):
@@ -1118,13 +1293,21 @@ def benchmark_cmd(
 
         upskill benchmark ./skills/hf-eval-extraction/ -m haiku -m sonnet
 
+        upskill benchmark ./skills/hf-eval-extraction/ -m haiku -m sonnet --test-gen-model opus
+
         upskill benchmark ./skills/my-skill/ -m gpt-4o -m claude-sonnet --runs 5
 
         upskill benchmark ./skills/my-skill/ -m haiku -t ./custom_tests.json -v
     """
     asyncio.run(
         _benchmark_async(
-            skill_path, list(models), num_runs, tests, output, verbose
+            skill_path,
+            list(models),
+            test_gen_model,
+            num_runs,
+            tests,
+            output,
+            verbose,
         )
     )
 
@@ -1132,6 +1315,7 @@ def benchmark_cmd(
 async def _benchmark_async(
     skill_path: str,
     models: list[str],
+    test_gen_model: str | None,
     num_runs: int,
     tests_path: str | None,
     output_dir: str | None,
@@ -1141,6 +1325,26 @@ async def _benchmark_async(
     from upskill.evaluate import run_test
 
     config = Config.load()
+    resolved = resolve_models(
+        "benchmark",
+        config=config,
+        cli_models=models,
+        cli_test_gen_model=test_gen_model,
+        num_runs=num_runs,
+    )
+    evaluation_models = _require_resolved_models(
+        resolved.evaluation_models,
+        field="evaluation_models",
+        command="benchmark",
+    )
+    test_gen_model = _require_resolved_model(
+        resolved.test_generation_model,
+        field="test_generation_model",
+        command="benchmark",
+    )
+
+    _print_model_plan("benchmark", resolved, runs=num_runs)
+
     skill = Skill.load(Path(skill_path))
 
     async with _fast_agent_context(config) as agent:
@@ -1156,9 +1360,11 @@ async def _benchmark_async(
             test_cases = skill.tests
         else:
             console.print("Generating test cases from skill...", style="dim")
+            await _set_agent_model(agent.test_gen, test_gen_model)
             test_cases = await generate_tests(
                 skill.description,
                 generator=agent.test_gen,
+                model=test_gen_model,
             )
 
         # Setup output directory
@@ -1171,13 +1377,15 @@ async def _benchmark_async(
         console.print(f"Results will be saved to: {batch_folder}", style="dim")
 
         # Track results per model
-        model_results: dict[str, list[RunResult]] = {m: [] for m in models}
+        model_results: dict[str, list[RunResult]] = {m: [] for m in evaluation_models}
         all_run_results: list[RunResult] = []
 
-        console.print(f"\nBenchmarking [bold]{skill.name}[/bold] across {len(models)} model(s)")
+        console.print(
+            f"\nBenchmarking [bold]{skill.name}[/bold] across {len(evaluation_models)} model(s)"
+        )
         console.print(f"  {len(test_cases)} test case(s), {num_runs} run(s) per model\n")
 
-        for model in models:
+        for model in evaluation_models:
             console.print(f"[bold]{model}[/bold]")
 
             for run_num in range(1, num_runs + 1):
@@ -1198,6 +1406,10 @@ async def _benchmark_async(
                             tc,
                             evaluator=agent.evaluator,
                             skill=skill,
+                            model=model,
+                            instance_name=(
+                                f"benchmark ({model} run {run_num} test {tc_idx})"
+                            ),
                         )
                     except Exception as e:
                         console.print(f"  [red]Test error: {e}[/red]")
@@ -1286,7 +1498,7 @@ async def _benchmark_async(
 
         summary = BatchSummary(
             batch_id=batch_id,
-            model=", ".join(models),
+            model=", ".join(evaluation_models),
             task=skill.description,
             total_runs=len(all_run_results),
             passed_runs=sum(1 for r in all_run_results if r.passed),
@@ -1297,7 +1509,13 @@ async def _benchmark_async(
 @main.command("runs")
 @click.option("-d", "--dir", "runs_dir", type=click.Path(exists=True), help="Runs directory")
 @click.option("-s", "--skill", "skills", multiple=True, help="Filter by skill name(s)")
-@click.option("-m", "--model", "models", multiple=True, help="Filter by model(s)")
+@click.option(
+    "-m",
+    "--model",
+    "models",
+    multiple=True,
+    help="Filter historical run data by model(s)",
+)
 @click.option("--csv", "csv_output", type=click.Path(), help="Export to CSV file")
 @click.option(
     "--metric",
@@ -1413,7 +1631,13 @@ def runs_cmd(
 @main.command("plot", hidden=True)
 @click.option("-d", "--dir", "runs_dir", type=click.Path(exists=True), help="Runs directory")
 @click.option("-s", "--skill", "skills", multiple=True, help="Filter by skill name(s)")
-@click.option("-m", "--model", "models", multiple=True, help="Filter by model(s)")
+@click.option(
+    "-m",
+    "--model",
+    "models",
+    multiple=True,
+    help="Filter historical run data by model(s)",
+)
 @click.option(
     "--metric",
     type=click.Choice(["success", "tokens"]),

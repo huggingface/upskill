@@ -235,14 +235,14 @@ async def improve_skill(
     Args:
         skill: The existing skill to improve
         instructions: What improvements to make
-        model: Model to use for generation
+        model: Model to use for skill generation
         config: Configuration
 
     Returns:
         Improved Skill object
     """
     # config = config or Config.load()
-    # model = model or config.model
+    # model = model or config.skill_generation_model
 
     prompt = IMPROVE_PROMPT.format(
         name=skill.name,

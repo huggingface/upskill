@@ -3,14 +3,24 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 UPSKILL_CONFIG_FILE = "upskill.config.yaml"
 LEGACY_CONFIG_FILE = "config.yaml"
 UPSKILL_CONFIG_ENV = "UPSKILL_CONFIG"
+
+
+@dataclass(frozen=True)
+class UpskillConfigPathResolution:
+    """Resolved upskill config path and where it was found."""
+
+    path: Path | None
+    source: str
+    exists: bool
 
 
 def get_config_dir() -> Path:
@@ -29,6 +39,11 @@ def get_legacy_config_path() -> Path:
 
 
 def find_upskill_config_path() -> Path | None:
+    """Find upskill config path in priority order."""
+    return resolve_upskill_config_path().path
+
+
+def resolve_upskill_config_path() -> UpskillConfigPathResolution:
     """Find upskill config path in priority order.
 
     Priority:
@@ -39,18 +54,29 @@ def find_upskill_config_path() -> Path | None:
     config_override = os.getenv(UPSKILL_CONFIG_ENV)
     if config_override:
         override_path = Path(config_override).expanduser()
-        if override_path.exists():
-            return override_path
+        return UpskillConfigPathResolution(
+            path=override_path,
+            source=f"{UPSKILL_CONFIG_ENV} env var",
+            exists=override_path.exists(),
+        )
 
     local_config = get_local_config_path()
     if local_config.exists():
-        return local_config
+        return UpskillConfigPathResolution(
+            path=local_config,
+            source="project-local config",
+            exists=True,
+        )
 
     legacy_config = get_legacy_config_path()
     if legacy_config.exists():
-        return legacy_config
+        return UpskillConfigPathResolution(
+            path=legacy_config,
+            source="legacy user config",
+            exists=True,
+        )
 
-    return None
+    return UpskillConfigPathResolution(path=None, source="defaults", exists=False)
 
 
 def get_default_skills_dir() -> Path:
@@ -78,9 +104,22 @@ def find_config_path() -> Path:
 class Config(BaseModel):
     """upskill configuration."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     # Model settings
-    model: str = Field(default="sonnet", description="Model for generation (FastAgent format)")
-    eval_model: str | None = Field(default=None, description="Model for eval (defaults to model)")
+    skill_generation_model: str = Field(
+        default="sonnet",
+        validation_alias=AliasChoices("skill_generation_model", "model"),
+        description="Model for skill generation (FastAgent format)",
+    )
+    eval_model: str | None = Field(
+        default=None,
+        description="Model for evaluation (defaults to skill_generation_model)",
+    )
+    test_gen_model: str | None = Field(
+        default=None,
+        description="Model for test generation (defaults to skill generation model)",
+    )
 
     # Directory settings
     skills_dir: Path = Field(
@@ -135,7 +174,12 @@ class Config(BaseModel):
     @property
     def effective_eval_model(self) -> str:
         """Get the model to use for evaluation."""
-        return self.eval_model or self.model
+        return self.eval_model or self.skill_generation_model
+
+    @property
+    def model(self) -> str:
+        """Backward-compatible alias for ``skill_generation_model``."""
+        return self.skill_generation_model
 
     @property
     def effective_fastagent_config(self) -> Path:
