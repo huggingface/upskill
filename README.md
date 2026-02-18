@@ -261,6 +261,31 @@ upskill list -v
         └── scripts/validate.py
 ```
 
+### `upskill delete`
+
+Delete a generated skill safely from your skills directory.
+
+```bash
+upskill delete SKILL_NAME [OPTIONS]
+```
+
+**Arguments:**
+- `SKILL_NAME` - Name of the skill directory to remove (not a path)
+
+**Options:**
+- `-d, --dir PATH` - Skills directory (default: configured `skills_dir`)
+- `--force` - Skip confirmation prompt
+
+**Examples:**
+
+```bash
+# Confirm before deleting
+upskill delete git-commit-messages
+
+# Delete without confirmation
+upskill delete my-skill --force
+```
+
 ### `upskill runs`
 
 View run results as a plot, or export to CSV. By default, shows a visual comparison of baseline vs with-skill performance.
