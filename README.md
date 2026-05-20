@@ -617,3 +617,105 @@ upskill supports local models through any OpenAI-compatible endpoint (llama.cpp,
 # Configure endpoint via fast-agent config/env, then evaluate
 upskill eval ./skills/my-skill/ --model generic.my-model
 ```
+
+## CLI Providers (Claude Code, Copilot CLI, Kiro CLI)
+
+upskill can drive evaluations through CLI tools you already pay for, instead of
+sending API requests to Anthropic/OpenAI directly. This lets you reuse existing
+subscriptions (Claude Code/Pro, GitHub Copilot, Kiro) without setting any
+`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` for evaluation.
+
+### Supported providers (v1)
+
+| Alias              | Underlying CLI                | Subscription            |
+|--------------------|-------------------------------|-------------------------|
+| `cli.claude-code`  | `claude` (Claude Code)        | Claude Code / Pro       |
+| `cli.copilot`      | `copilot` (GitHub Copilot CLI) | GitHub + Copilot        |
+| `cli.kiro`         | `kiro-cli`                    | Kiro                    |
+
+### Quick start
+
+Make sure the CLI is installed and authenticated, then point `--model` at it:
+
+```bash
+# Authenticate the CLIs once
+claude login        # Claude Code
+gh auth login       # GitHub Copilot CLI (with Copilot scope)
+kiro-cli login      # Kiro CLI
+
+# Evaluate a skill against your subscription-backed CLIs (no API keys needed!)
+upskill eval ./skills/my-skill/ -m cli.claude-code
+
+# Mixed benchmark across CLI agents and a fast-agent model
+upskill eval ./skills/my-skill/ -m cli.claude-code -m cli.copilot -m cli.kiro -m sonnet
+
+# Cross-model eval pass during generate (skill is generated with sonnet,
+# evaluated with Claude Code via the CLI)
+upskill generate "write good git commit messages" --model sonnet --eval-model cli.claude-code
+
+# Fully CLI-backed generation + evaluation (no API keys at all)
+upskill generate "write good git commit messages" \
+    --model cli.claude-code \
+    --test-gen-model cli.claude-code
+```
+
+### Per-provider configuration
+
+Override CLI commands, extra args, timeouts, and env vars in `upskill.config.yaml`:
+
+```yaml
+cli_providers:
+  claude-code:
+    command: claude
+    args: ["--model", "sonnet"]    # Pass model selection to the CLI
+    timeout_seconds: 600
+    # By default, claude-code unsets ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN,
+    # CLAUDE_CODE_USE_BEDROCK, and CLAUDE_CODE_USE_VERTEX so the `claude` CLI
+    # uses your Pro subscription instead of falling back to API-key billing.
+    # Override unset_env: [] to keep these vars (e.g. for Bedrock/Vertex routing).
+  copilot:
+    command: copilot
+  kiro:
+    command: kiro-cli
+    args: ["--trust-all-tools"]    # Opt in to unattended tool execution
+```
+
+Defaults are sane: with no config, `cli.claude-code` runs `claude`, `cli.copilot`
+runs `copilot`, and `cli.kiro` runs `kiro-cli`.
+
+### Subscription billing
+
+upskill never wants to silently spend your paid API quota when you've
+configured a CLI provider. By default each runner strips the env vars that
+would otherwise route the CLI onto API-key billing. For Claude Code that means
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, and
+`CLAUDE_CODE_USE_VERTEX` are removed from the subprocess environment. When any
+of these were set, upskill prints a one-shot stderr line so you can see what
+was stripped.
+
+If you actually want API-key billing for a CLI run (e.g. routing Claude Code
+through your own Bedrock account), override the list:
+
+```yaml
+cli_providers:
+  claude-code:
+    command: claude
+    unset_env: []           # keep ANTHROPIC_API_KEY etc.
+```
+
+### Caveats
+
+- **Token usage.** Claude Code reports input/output tokens via its JSON output;
+  Copilot and Kiro do not. When a CLI does not expose token counts,
+  `metadata.tokens_unavailable` is set on the result and tokens are recorded as
+  zero in `upskill runs` plots.
+- **Authentication.** All three runners assume the binary is on `PATH` and
+  already signed in. If a runner cannot find the binary, you'll get an
+  actionable error pointing you at the right `login` command.
+- **Structured outputs.** Skill and test generation through a CLI provider goes
+  through the CLI's plain-text response (instructed to emit JSON matching the
+  expected schema). Output is best-effort: if a CLI returns malformed JSON,
+  upskill surfaces it as a parsing error rather than crashing.
+- **HF Jobs.** `--executor jobs --no-wait` is incompatible with `cli.*` models
+  (CLI providers always run locally). If you mix them, upskill rejects the
+  command with a clear error.

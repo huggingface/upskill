@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from click.testing import CliRunner
@@ -31,6 +31,7 @@ from upskill.models import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -602,7 +603,8 @@ async def test_benchmark_uses_config_execution_defaults_when_cli_unset(
 
     async def fake_run_with_skill_benchmark(*args: object, **kwargs: object):
         del args
-        assert kwargs["executor"] is fake_executor
+        executor_factory = cast("Callable[[str], object]", kwargs["executor_factory"])
+        assert executor_factory("haiku") is fake_executor
         num_runs = kwargs["num_runs"]
         max_parallel = kwargs["max_parallel"]
         assert isinstance(num_runs, int)
