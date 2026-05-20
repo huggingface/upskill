@@ -46,6 +46,47 @@ def build_fastagent_model_references(
     }
 
 
+CLI_MODEL_PREFIX = "cli."
+
+
+def _is_cli(model: str) -> bool:
+    return model.startswith(CLI_MODEL_PREFIX)
+
+
+def _resolve_eval_test_gen_model(
+    *,
+    cli_test_gen_model: str | None,
+    config: Config,
+    evaluation_models: list[str],
+) -> str:
+    """Pick the test-generation model for ``eval``/``benchmark`` runs.
+
+    Default order:
+      1. Explicit CLI override (``--test-gen-model``).
+      2. Config (``test_gen_model``), unless that's a non-cli alias and *every*
+         evaluation model is ``cli.*`` -- in which case fall back to the first
+         CLI eval model so the whole run can stay key-free.
+      3. Config (``skill_generation_model``).
+      4. The first evaluation model (when all are ``cli.*``).
+    """
+    if cli_test_gen_model is not None:
+        return cli_test_gen_model
+
+    all_eval_cli = bool(evaluation_models) and all(_is_cli(m) for m in evaluation_models)
+    config_test_gen = config.test_gen_model
+
+    if all_eval_cli and (config_test_gen is None or not _is_cli(config_test_gen)):
+        return evaluation_models[0]
+
+    if config_test_gen is not None:
+        return config_test_gen
+
+    if all_eval_cli:
+        return evaluation_models[0]
+
+    return config.skill_generation_model
+
+
 def resolve_models(
     command: CommandName,
     *,
@@ -92,8 +133,10 @@ def resolve_models(
         is_benchmark_mode = len(evaluation_models) > 1 or num_runs > 1
         run_baseline = (not no_baseline) if not is_benchmark_mode else False
         return ResolvedModels(
-            test_generation_model=(
-                cli_test_gen_model or config.test_gen_model or config.skill_generation_model
+            test_generation_model=_resolve_eval_test_gen_model(
+                cli_test_gen_model=cli_test_gen_model,
+                config=config,
+                evaluation_models=evaluation_models,
             ),
             evaluation_models=evaluation_models,
             is_benchmark_mode=is_benchmark_mode,
@@ -105,8 +148,10 @@ def resolve_models(
         if not evaluation_models:
             raise ValueError("benchmark requires at least one model")
         return ResolvedModels(
-            test_generation_model=(
-                cli_test_gen_model or config.test_gen_model or config.skill_generation_model
+            test_generation_model=_resolve_eval_test_gen_model(
+                cli_test_gen_model=cli_test_gen_model,
+                config=config,
+                evaluation_models=evaluation_models,
             ),
             evaluation_models=evaluation_models,
             is_benchmark_mode=True,
