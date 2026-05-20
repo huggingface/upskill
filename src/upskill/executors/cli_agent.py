@@ -68,7 +68,10 @@ def _coerce_cli_metadata(
     """Filter CLI runner metadata down to ``ExecutionResult`` compatible types."""
     coerced: dict[str, ExecutionMetadataValue] = {}
     for key, value in metadata.items():
-        if value is None or isinstance(value, str | int | float | bool):
+        # Use a tuple of types instead of the PEP 604 union form for the
+        # broadest compatibility with isinstance() across runtimes and
+        # static analyzers.
+        if value is None or isinstance(value, (str, int, float, bool)):
             coerced[key] = value
     return coerced
 

@@ -61,13 +61,16 @@ def _resolve_eval_test_gen_model(
 ) -> str:
     """Pick the test-generation model for ``eval``/``benchmark`` runs.
 
-    Default order:
-      1. Explicit CLI override (``--test-gen-model``).
-      2. Config (``test_gen_model``), unless that's a non-cli alias and *every*
-         evaluation model is ``cli.*`` -- in which case fall back to the first
-         CLI eval model so the whole run can stay key-free.
-      3. Config (``skill_generation_model``).
-      4. The first evaluation model (when all are ``cli.*``).
+    Resolution order (first match wins):
+
+      1. Explicit CLI override (``--test-gen-model``), if provided.
+      2. When every evaluation model is ``cli.<provider>`` and the configured
+         ``test_gen_model`` is unset (or itself a non-CLI alias), use the first
+         CLI evaluation model so the run stays key-free end-to-end.
+      3. Config ``test_gen_model``, when set (covers both non-CLI and CLI
+         values, including the all-CLI case where the user explicitly opted
+         into a specific CLI test-gen model).
+      4. Config ``skill_generation_model`` as the final fallback.
     """
     if cli_test_gen_model is not None:
         return cli_test_gen_model
@@ -80,9 +83,6 @@ def _resolve_eval_test_gen_model(
 
     if config_test_gen is not None:
         return config_test_gen
-
-    if all_eval_cli:
-        return evaluation_models[0]
 
     return config.skill_generation_model
 
