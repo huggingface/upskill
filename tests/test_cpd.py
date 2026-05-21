@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import zipfile
 from typing import TYPE_CHECKING
 
+import pytest
+
+from scripts import cpd
 from scripts.cpd import build_cpd_command, resolve_cli_exit_code, resolve_platform
 
 if TYPE_CHECKING:
@@ -55,3 +59,27 @@ def test_resolve_cli_exit_code_honors_check_mode() -> None:
     assert resolve_cli_exit_code(cpd_exit_code=4, check=False) == 0
     assert resolve_cli_exit_code(cpd_exit_code=4, check=True) == 1
     assert resolve_cli_exit_code(cpd_exit_code=7, check=True) == 7
+
+
+@pytest.mark.parametrize("unsafe_member", ["../escape.txt", "..\\escape.txt", "C:\\tmp\\escape.txt"])
+def test_ensure_pmd_rejects_zip_path_traversal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_member: str,
+) -> None:
+    tools_dir = tmp_path / "tools"
+    pmd_dir = tools_dir / f"pmd-bin-{cpd.PMD_VERSION}"
+    tools_dir.mkdir()
+    archive_path = tools_dir / f"pmd-{cpd.PMD_VERSION}.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(f"pmd-bin-{cpd.PMD_VERSION}/bin/pmd", "#!/bin/sh\n")
+        archive.writestr(unsafe_member, "bad")
+
+    monkeypatch.setattr(cpd, "TOOLS_DIR", tools_dir)
+    monkeypatch.setattr(cpd, "PMD_DIR", pmd_dir)
+    monkeypatch.setattr(cpd, "download_file", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="Unsafe path in archive"):
+        cpd.ensure_pmd(resolve_platform(system="linux", arch="x86_64"))
+
+    assert not (tmp_path / "escape.txt").exists()

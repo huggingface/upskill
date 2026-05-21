@@ -27,7 +27,7 @@ import tarfile
 import urllib.request
 import zipfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Final
 
 JRE_VERSION: Final = "17.0.9+9"
@@ -125,16 +125,48 @@ def download_file(url: str, destination: Path, description: str) -> None:
     print(f"  Downloaded to {destination}")
 
 
+def is_unsafe_archive_member(member_name: str) -> bool:
+    """Detect archive paths that are absolute or traverse parents on POSIX or Windows."""
+    posix_path = PurePosixPath(member_name)
+    windows_path = PureWindowsPath(member_name)
+    return (
+        posix_path.is_absolute()
+        or windows_path.is_absolute()
+        or ".." in posix_path.parts
+        or ".." in windows_path.parts
+    )
+
+
 def extract_tar_archive(archive_path: Path, destination: Path) -> None:
     """Extract a tar.gz archive while guarding against path traversal."""
     destination_root = destination.resolve()
     with tarfile.open(archive_path, "r:gz") as archive:
         for member in archive.getmembers():
+            if is_unsafe_archive_member(member.name):
+                message = f"Unsafe path in archive {archive_path}: {member.name}"
+                raise RuntimeError(message)
             member_path = (destination_root / member.name).resolve()
             try:
                 member_path.relative_to(destination_root)
             except ValueError as error:
                 message = f"Unsafe path in archive {archive_path}: {member.name}"
+                raise RuntimeError(message) from error
+        archive.extractall(destination_root)
+
+
+def extract_zip_archive(archive_path: Path, destination: Path) -> None:
+    """Extract a zip archive while guarding against path traversal."""
+    destination_root = destination.resolve()
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        for member in archive.infolist():
+            if is_unsafe_archive_member(member.filename):
+                message = f"Unsafe path in archive {archive_path}: {member.filename}"
+                raise RuntimeError(message)
+            member_path = (destination_root / member.filename).resolve()
+            try:
+                member_path.relative_to(destination_root)
+            except ValueError as error:
+                message = f"Unsafe path in archive {archive_path}: {member.filename}"
                 raise RuntimeError(message) from error
         archive.extractall(destination_root)
 
@@ -193,8 +225,7 @@ def ensure_pmd(platform_config: PlatformConfig) -> Path:
         download_file(PMD_URL, archive_path, f"PMD {PMD_VERSION}")
 
     print("Extracting PMD...")
-    with zipfile.ZipFile(archive_path, "r") as archive:
-        archive.extractall(TOOLS_DIR)
+    extract_zip_archive(archive_path, TOOLS_DIR)
 
     if platform_config.system != "windows":
         pmd_bin.chmod(0o755)
