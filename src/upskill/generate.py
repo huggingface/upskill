@@ -9,8 +9,9 @@ from upskill.manifest_utils import parse_skill_manifest_text
 from upskill.models import Skill, SkillMetadata, SkillRecord, SkillState, TestCase, TestCaseSuite
 
 if TYPE_CHECKING:
-    from fast_agent.interfaces import AgentProtocol
     from fast_agent.skills.registry import SkillManifest
+
+    from upskill.cli_agents import SkillGenerator
 
 # Few-shot examples for test generation
 TEST_EXAMPLES = """
@@ -110,7 +111,7 @@ def _build_skill_from_manifest(
 
 async def generate_skill(
     task: str,
-    generator: AgentProtocol,
+    generator: SkillGenerator,
     examples: list[str] | None = None,
     model: str | None = None,
 ) -> SkillRecord:
@@ -136,7 +137,7 @@ async def generate_skill(
 
 async def generate_tests(
     task: str,
-    generator: AgentProtocol,
+    generator: SkillGenerator,
 ) -> list[TestCase]:
     """Generate synthetic test cases from a task description using fast-agent."""
 
@@ -171,7 +172,7 @@ async def generate_tests(
 async def refine_skill(
     skill: SkillRecord,
     failures: list[str],
-    generator: AgentProtocol,
+    generator: SkillGenerator,
     model: str | None = None,
 ) -> SkillRecord:
     """Refine a skill based on evaluation failures using fast-agent."""
@@ -234,7 +235,7 @@ Do not wrap the output in code fences or JSON.
 async def improve_skill(
     skill: SkillRecord,
     instructions: str,
-    generator: AgentProtocol,
+    generator: SkillGenerator,
     model: str | None = None,
 ) -> SkillRecord:
     """Improve an existing skill based on instructions.

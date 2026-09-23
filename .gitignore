@@ -46,6 +46,10 @@ Thumbs.db
 *.local
 .claude/
 
+# Generated upskill output (per default skills_dir / runs_dir)
+runs/
+skills/
+
 # Temporary files
 *.tmp
 *.temp
