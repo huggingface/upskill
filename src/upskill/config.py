@@ -10,6 +10,8 @@ from typing import Literal
 import yaml
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
+from upskill.cli_agents import CliProviderConfig, default_cli_providers
+
 UPSKILL_CONFIG_FILE = "upskill.config.yaml"
 LEGACY_CONFIG_FILE = "config.yaml"
 UPSKILL_CONFIG_ENV = "UPSKILL_CONFIG"
@@ -90,6 +92,36 @@ def get_default_runs_dir() -> Path:
     return Path.cwd() / "runs"
 
 
+def _merge_cli_providers(
+    raw: object,
+) -> dict[str, CliProviderConfig]:
+    """Merge user-supplied ``cli_providers`` mapping with the v1 defaults.
+
+    Users can override a single provider (e.g. `claude-code`) without losing
+    the other built-in entries. Unknown keys are accepted so new CLIs can be
+    declared in config without code changes (the router still has to know how
+    to wire them — see ``executors/router.py``).
+    """
+    if raw is None:
+        return default_cli_providers()
+    if not isinstance(raw, dict):
+        raise TypeError("`cli_providers` must be a mapping of provider name to config.")
+
+    merged = default_cli_providers()
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            raise TypeError("`cli_providers` keys must be strings.")
+        if isinstance(value, CliProviderConfig):
+            merged[key] = value
+            continue
+        if not isinstance(value, dict):
+            raise TypeError(
+                f"`cli_providers.{key}` must be a mapping of fields, got {type(value).__name__}."
+            )
+        merged[key] = CliProviderConfig.model_validate(value)
+    return merged
+
+
 def find_config_path() -> Path:
     """Find the fastagent config file, checking cwd first then package root."""
     cwd_config = Path.cwd() / "fastagent.config.yaml"
@@ -160,6 +192,15 @@ class Config(BaseModel):
     # FastAgent settings
     fastagent_config: Path | None = Field(default=None, description="Path to fastagent.config.yaml")
 
+    # CLI-backed agent providers (Claude Code, Copilot CLI, Kiro CLI, ...)
+    cli_providers: dict[str, CliProviderConfig] = Field(
+        default_factory=default_cli_providers,
+        description=(
+            "Per-provider configuration for cli.<provider> model aliases. "
+            "Keys map to the suffix after `cli.`."
+        ),
+    )
+
     @classmethod
     def load(cls) -> Config:
         """Load config from file, or return defaults."""
@@ -177,6 +218,8 @@ class Config(BaseModel):
                 data["runs_dir"] = Path(data["runs_dir"])
             if "fastagent_config" in data and isinstance(data["fastagent_config"], str):
                 data["fastagent_config"] = Path(data["fastagent_config"])
+            if "cli_providers" in data:
+                data["cli_providers"] = _merge_cli_providers(data["cli_providers"])
             return cls(**data)
 
         return cls()
@@ -192,6 +235,9 @@ class Config(BaseModel):
         data["runs_dir"] = str(self.runs_dir)
         if self.fastagent_config:
             data["fastagent_config"] = str(self.fastagent_config)
+        data["cli_providers"] = {
+            key: provider.model_dump(mode="json") for key, provider in self.cli_providers.items()
+        }
         with open(config_path, "w", encoding="utf-8") as f:
             yaml.dump(data, f, default_flow_style=False)
 

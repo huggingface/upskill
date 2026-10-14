@@ -7,6 +7,7 @@ import json
 import sys
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, TypeVar, cast
@@ -19,10 +20,12 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.tree import Tree
 
+from upskill.cli_agents import CliFastAgentAdapter
 from upskill.config import Config, resolve_upskill_config_path
 from upskill.evaluate import build_eval_requests, evaluate_skill, get_failure_descriptions
 from upskill.executors.local_fast_agent import LocalFastAgentExecutor
 from upskill.executors.remote_fast_agent import RemoteFastAgentExecutor
+from upskill.executors.router import build_cli_executor, is_cli_model, select_executor_for_model
 from upskill.generate import generate_skill, generate_tests, improve_skill, refine_skill
 from upskill.hf_jobs import JobsConfig, verify_artifact_repo_access
 from upskill.logging import (
@@ -58,6 +61,7 @@ if TYPE_CHECKING:
     from fast_agent.agents.llm_agent import LlmAgent
     from fast_agent.interfaces import AgentProtocol
 
+    from upskill.cli_agents import SkillGenerator
     from upskill.executors.base import Executor
 
 load_dotenv()
@@ -220,6 +224,97 @@ def _install_fast_agent_model_references(
     fast_config.model_references = merged_references
 
 
+@dataclass(slots=True)
+class _AgentSession:
+    """Session shape consumed by ``generate``/``eval`` orchestration helpers.
+
+    Mirrors the relevant attributes of fast-agent's session so callers don't
+    need to care whether they're talking to a fast-agent agent or a
+    ``CliFastAgentAdapter`` for a given phase.
+    """
+
+    skill_gen: SkillGenerator
+    test_gen: SkillGenerator
+
+
+@asynccontextmanager
+async def _agent_session(
+    config: Config,
+    *,
+    skill_gen_model: str,
+    test_gen_model: str,
+    cards_source_dir: Path,
+    artifact_root: Path,
+    model_references: Mapping[str, Mapping[str, str]] | None = None,
+) -> AsyncIterator[_AgentSession]:
+    """Yield a session whose skill_gen / test_gen agents fit the resolved models.
+
+    - If both phases use ``cli.<provider>`` models, fast-agent is skipped
+      entirely (no API keys required).
+    - If both phases use fast-agent compatible models, behavior is identical
+      to the legacy ``_fast_agent_context`` path.
+    - Hybrid runs (one CLI, one fast-agent) load fast-agent for the non-CLI
+      phase and override the CLI phase with a ``CliFastAgentAdapter``.
+    """
+    skill_gen_is_cli = is_cli_model(skill_gen_model)
+    test_gen_is_cli = is_cli_model(test_gen_model)
+    cli_executor = build_cli_executor(config) if (skill_gen_is_cli or test_gen_is_cli) else None
+
+    def _build_adapter(model: str, agent_name: str) -> CliFastAgentAdapter:
+        assert cli_executor is not None  # narrow for ty
+        return CliFastAgentAdapter(
+            executor=cli_executor,
+            model=model,
+            fastagent_config_path=config.effective_fastagent_config,
+            cards_source_dir=cards_source_dir,
+            artifact_root=artifact_root / agent_name,
+            agent_name=agent_name,
+        )
+
+    if skill_gen_is_cli and test_gen_is_cli:
+        # Pure CLI path: no fast-agent, no API keys.
+        yield _AgentSession(
+            skill_gen=_build_adapter(skill_gen_model, "skill_gen"),
+            test_gen=_build_adapter(test_gen_model, "test_gen"),
+        )
+        return
+
+    if not skill_gen_is_cli and not test_gen_is_cli:
+        async with _fast_agent_context(config, model_references=model_references) as fa_session:
+            yield _AgentSession(
+                skill_gen=fa_session.skill_gen,
+                test_gen=fa_session.test_gen,
+            )
+        return
+
+    # Hybrid: load fast-agent for the non-CLI side, override the CLI side.
+    sanitized_references = _strip_cli_model_references(model_references)
+    async with _fast_agent_context(config, model_references=sanitized_references) as fa_session:
+        skill_gen: object = (
+            _build_adapter(skill_gen_model, "skill_gen")
+            if skill_gen_is_cli
+            else fa_session.skill_gen
+        )
+        test_gen: object = (
+            _build_adapter(test_gen_model, "test_gen") if test_gen_is_cli else fa_session.test_gen
+        )
+        yield _AgentSession(skill_gen=skill_gen, test_gen=test_gen)
+
+
+def _strip_cli_model_references(
+    references: Mapping[str, Mapping[str, str]] | None,
+) -> Mapping[str, Mapping[str, str]] | None:
+    """Drop ``cli.*`` entries so fast-agent doesn't try to resolve them."""
+    if not references:
+        return references
+    sanitized: dict[str, dict[str, str]] = {}
+    for namespace, entries in references.items():
+        sanitized[namespace] = {
+            slot: model for slot, model in entries.items() if not is_cli_model(model)
+        }
+    return sanitized
+
+
 def _require_resolved_model(value: str | None, *, field: str, command: str) -> str:
     """Require a non-null resolved model value for a command."""
     if value is None:
@@ -263,9 +358,80 @@ def _build_executor(
     )
 
 
+ExecutorFactory = Callable[[str], "Executor"]
+
+
+def _make_executor_factory(
+    *,
+    config: Config,
+    executor_name: ExecutorName,
+    jobs_config: JobsConfig | None,
+    jobs_progress_callback: Callable[[str], None] | None = None,
+) -> ExecutorFactory:
+    """Return a per-model executor factory bound to the resolved config.
+
+    The returned callable picks ``CliAgentExecutor`` for ``cli.<provider>``
+    models and the configured fast-agent backend for everything else, mirroring
+    ``upskill.executors.router.select_executor_for_model`` semantics.
+
+    The factory caches the fast-agent and CLI executor instances after first
+    use so multi-model benchmarks don't re-run jobs preflight checks per model.
+    """
+    cached_fast_agent: list[Executor] = []
+    cached_cli: list[Executor] = []
+
+    def _factory(model: str) -> Executor:
+        if is_cli_model(model):
+            if not cached_cli:
+                cached_cli.append(select_executor_for_model(model, config=config))
+            return cached_cli[0]
+        if not cached_fast_agent:
+            cached_fast_agent.append(
+                _build_executor(
+                    executor_name,
+                    jobs_config=jobs_config,
+                    progress_callback=jobs_progress_callback,
+                )
+            )
+        return cached_fast_agent[0]
+
+    return _factory
+
+
+def _reject_cli_models_with_jobs_no_wait(models: list[str]) -> None:
+    """Reject ``cli.*`` models in the `--executor jobs --no-wait` submission path."""
+    cli_models = [model for model in models if is_cli_model(model)]
+    if not cli_models:
+        return
+    raise click.ClickException(
+        "`--executor jobs --no-wait` is incompatible with CLI agent models "
+        f"({', '.join(cli_models)}). CLI providers always run locally; either "
+        "remove `--no-wait` or omit the cli.<provider> models from this run."
+    )
+
+
 def _resolve_executor_name(config: Config, cli_executor_name: ExecutorName | None) -> ExecutorName:
     """Resolve the effective execution backend from CLI override or config."""
     return cli_executor_name or config.executor
+
+
+def _maybe_downgrade_to_local(
+    executor_name: ExecutorName,
+    *,
+    models: list[str],
+) -> ExecutorName:
+    """Downgrade ``jobs`` to ``local`` when every model in ``models`` is cli.*.
+
+    CLI providers always run locally; forcing the user to supply jobs flags
+    (``--artifact-repo`` etc.) when their entire run is CLI-backed adds friction
+    without any benefit. The fast-agent ``local``/``jobs`` distinction only
+    matters once at least one phase routes through fast-agent.
+    """
+    if executor_name != "jobs":
+        return executor_name
+    if models and all(is_cli_model(model) for model in models):
+        return "local"
+    return executor_name
 
 
 def _resolve_num_runs(
@@ -527,6 +693,8 @@ async def _load_test_cases(
     tests_path: str | None,
     test_gen_model: str,
     model_references: Mapping[str, Mapping[str, str]],
+    artifact_root: Path,
+    cards_source_dir: Path,
 ) -> tuple[list[TestCase], str]:
     """Load explicit, persisted, or generated test cases for a skill."""
     if tests_path:
@@ -537,7 +705,15 @@ async def _load_test_cases(
     if skill_record.state.tests:
         return skill_record.state.tests, "skill_meta.json"
 
-    async with _fast_agent_context(config, model_references=model_references) as agent:
+    # Use the dispatcher so cli.<provider> test-gen models work with no API keys.
+    async with _agent_session(
+        config,
+        skill_gen_model=test_gen_model,
+        test_gen_model=test_gen_model,
+        cards_source_dir=cards_source_dir,
+        artifact_root=artifact_root / "test_gen_session",
+        model_references=model_references,
+    ) as agent:
         console.print(f"Generating test cases from skill with {test_gen_model}...", style="dim")
         test_cases = await generate_tests(
             skill_record.skill.description,
@@ -598,7 +774,7 @@ async def _create_generate_skill_record(
     examples: list[str] | None,
     from_skill: str | None,
     from_trace: str | None,
-    agent: FastAgentSession,
+    agent: _AgentSession,
     skill_gen_model: str,
 ) -> tuple[SkillRecord, str]:
     """Create or improve the skill record used by ``generate``."""
@@ -711,7 +887,7 @@ async def _run_generate_refinement_loop(
     skill_record: SkillRecord,
     task: str,
     test_cases: list[TestCase],
-    executor: Executor,
+    executor_factory: ExecutorFactory,
     config: Config,
     cards_path: Path,
     batch_id: str,
@@ -719,13 +895,14 @@ async def _run_generate_refinement_loop(
     skill_gen_model: str,
     log_runs: bool,
     max_parallel: int,
-    agent: FastAgentSession,
+    agent: _AgentSession,
 ) -> tuple[SkillRecord, EvalResults | None, list[RunResult]]:
     """Run generate-time eval/refinement attempts on the main model."""
     run_results: list[RunResult] = []
     prev_success_rate = 0.0
     results: EvalResults | None = None
     attempts = max(1, config.max_refine_attempts)
+    executor = executor_factory(skill_gen_model)
 
     for attempt in range(attempts):
         attempt_number = attempt + 1
@@ -802,7 +979,7 @@ async def _run_generate_extra_eval(
     skill_record: SkillRecord,
     task: str,
     test_cases: list[TestCase],
-    executor: Executor,
+    executor_factory: ExecutorFactory,
     config: Config,
     cards_path: Path,
     batch_id: str,
@@ -814,6 +991,7 @@ async def _run_generate_extra_eval(
 ) -> tuple[EvalResults, list[RunResult]]:
     """Run the optional cross-model eval pass for ``generate``."""
     console.print(f"Evaluating on {model}...", style="dim")
+    executor = executor_factory(model)
     results = await evaluate_skill(
         skill_record.skill,
         test_cases,
@@ -858,7 +1036,7 @@ async def _run_with_skill_benchmark(
     evaluation_models: list[str],
     num_runs: int,
     test_cases: list[TestCase],
-    executor: Executor,
+    executor_factory: ExecutorFactory,
     config: Config,
     cards_path: Path,
     batch_id: str,
@@ -874,6 +1052,7 @@ async def _run_with_skill_benchmark(
 
     for model in evaluation_models:
         console.print(f"[bold]{model}[/bold]")
+        executor = executor_factory(model)
 
         for run_num in range(1, num_runs + 1):
             run_folder = create_run_folder(batch_folder, len(all_run_results) + 1)
@@ -1049,15 +1228,30 @@ def main():
 @click.option(
     "-m",
     "--model",
-    help="Skill generation model for skill creation/refinement",
+    help=(
+        "Skill generation model for skill creation/refinement. Accepts both "
+        "fast-agent aliases (e.g. 'sonnet', 'haiku', 'openai.gpt-4.1', "
+        "'generic.<name>') and CLI agents (cli.claude-code, cli.copilot, "
+        "cli.kiro)."
+    ),
 )
 @click.option(
     "--test-gen-model",
-    help="Override test generation model for this run",
+    help=(
+        "Override test generation model for this run. Accepts both fast-agent "
+        "and cli.<provider> aliases."
+    ),
 )
 @click.option("-o", "--output", type=click.Path(), help="Output directory for skill")
 @click.option("--no-eval", is_flag=True, help="Skip eval and refinement")
-@click.option("--eval-model", help="Optional extra cross-model eval pass after generation")
+@click.option(
+    "--eval-model",
+    help=(
+        "Optional extra cross-model eval pass after generation. Accepts both "
+        "fast-agent aliases and cli.<provider> aliases (cli.claude-code, "
+        "cli.copilot, cli.kiro)."
+    ),
+)
 @_jobs_execution_options(
     executor_help="Execution backend for evaluation/refinement runs",
     runs_dir_help="Directory for run logs (default: ./runs)",
@@ -1177,16 +1371,6 @@ async def _generate_async(
     executor_name = _resolve_executor_name(config, executor_name)
     max_parallel = _resolve_max_parallel(config, max_parallel)
     jobs_secrets = _resolve_jobs_secrets(config, jobs_secrets)
-    jobs_config = _require_jobs_config(
-        executor_name=executor_name,
-        artifact_repo=artifact_repo,
-        wait=wait,
-        jobs_timeout=jobs_timeout,
-        jobs_flavor=jobs_flavor,
-        jobs_secrets=jobs_secrets,
-        jobs_namespace=jobs_namespace,
-        jobs_image=config.jobs_image,
-    )
     resolved = resolve_models(
         "generate",
         config=config,
@@ -1205,6 +1389,22 @@ async def _generate_async(
         command="generate",
     )
     extra_eval_model = resolved.extra_eval_model
+
+    relevant_models = [skill_gen_model, test_gen_model]
+    if extra_eval_model:
+        relevant_models.append(extra_eval_model)
+    executor_name = _maybe_downgrade_to_local(executor_name, models=relevant_models)
+    jobs_config = _require_jobs_config(
+        executor_name=executor_name,
+        artifact_repo=artifact_repo,
+        wait=wait,
+        jobs_timeout=jobs_timeout,
+        jobs_flavor=jobs_flavor,
+        jobs_secrets=jobs_secrets,
+        jobs_namespace=jobs_namespace,
+        jobs_image=config.jobs_image,
+    )
+
     model_references = build_fastagent_model_references(config=config, resolved=resolved)
 
     _print_model_plan("generate", resolved)
@@ -1217,9 +1417,16 @@ async def _generate_async(
     if log_runs:
         console.print(f"Logging runs to: {batch_folder}", style="dim")
 
-    async with _fast_agent_context(config, model_references=model_references) as agent:
-        cards = resources.files("upskill").joinpath("agent_cards")
-        with resources.as_file(cards) as cards_path:
+    cards = resources.files("upskill").joinpath("agent_cards")
+    with resources.as_file(cards) as cards_path:
+        async with _agent_session(
+            config,
+            skill_gen_model=skill_gen_model,
+            test_gen_model=test_gen_model,
+            cards_source_dir=cards_path,
+            artifact_root=batch_folder,
+            model_references=model_references,
+        ) as agent:
             skill_record, eval_task = await _create_generate_skill_record(
                 task=task,
                 examples=examples,
@@ -1260,17 +1467,18 @@ async def _generate_async(
                 _save_and_display(skill_record, output, config, artifact_path=batch_folder)
                 return
 
-            executor = _build_executor(
-                executor_name,
+            executor_factory = _make_executor_factory(
+                config=config,
+                executor_name=executor_name,
                 jobs_config=jobs_config,
-                progress_callback=_print_eval_progress,
+                jobs_progress_callback=_print_eval_progress,
             )
 
             skill_record, results, run_results = await _run_generate_refinement_loop(
                 skill_record=skill_record,
                 task=eval_task,
                 test_cases=test_cases,
-                executor=executor,
+                executor_factory=executor_factory,
                 config=config,
                 cards_path=cards_path,
                 batch_id=batch_id,
@@ -1288,7 +1496,7 @@ async def _generate_async(
                     skill_record=skill_record,
                     task=eval_task,
                     test_cases=test_cases,
-                    executor=executor,
+                    executor_factory=executor_factory,
                     config=config,
                     cards_path=cards_path,
                     batch_id=batch_id,
@@ -1425,11 +1633,18 @@ def _save_and_display(
     "--model",
     "models",
     multiple=True,
-    help="Evaluation model(s) to run tests on (repeatable)",
+    help=(
+        "Evaluation model(s) to run tests on (repeatable). Accepts fast-agent "
+        "aliases (e.g. 'sonnet') and CLI agents (cli.claude-code, cli.copilot, "
+        "cli.kiro). Mix freely: `-m sonnet -m cli.claude-code` is valid."
+    ),
 )
 @click.option(
     "--test-gen-model",
-    help="Override test generation model when tests must be generated",
+    help=(
+        "Override test generation model when tests must be generated. Accepts "
+        "both fast-agent aliases and cli.<provider> aliases."
+    ),
 )
 @click.option(
     "--runs",
@@ -1515,7 +1730,182 @@ def eval_cmd(
     )
 
 
-async def _eval_async(  # noqa: C901
+async def _submit_eval_jobs_no_wait(
+    *,
+    skill: Skill,
+    test_cases: list[TestCase],
+    evaluation_models: list[str],
+    resolved: ResolvedModels,
+    jobs_config: JobsConfig,
+    config: Config,
+    cards_path: Path,
+    batch_folder: Path,
+    num_runs: int,
+) -> None:
+    """Submit remote eval jobs without waiting (the `--executor jobs --no-wait` path)."""
+    if resolved.is_benchmark_mode:
+        submitted_job_refs: list[str] = []
+        for model in evaluation_models:
+            console.print(f"[bold]{model}[/bold]")
+            for run_num in range(1, num_runs + 1):
+                job_refs = await _submit_remote_eval_jobs(
+                    skill=skill,
+                    test_cases=test_cases,
+                    model=model,
+                    jobs_config=jobs_config,
+                    fastagent_config_path=config.effective_fastagent_config,
+                    cards_path=cards_path,
+                    artifact_root=batch_folder / "remote_downloads" / model / f"run_{run_num}",
+                    run_baseline=False,
+                    operation="benchmark",
+                )
+                submitted_job_refs.extend(job_refs)
+                console.print(f"Remote fast-agent job id(s): {', '.join(job_refs)}")
+        console.print(f"Submitted remote fast-agent job id(s): {', '.join(submitted_job_refs)}")
+        return
+
+    job_refs = await _submit_remote_eval_jobs(
+        skill=skill,
+        test_cases=test_cases,
+        model=evaluation_models[0],
+        jobs_config=jobs_config,
+        fastagent_config_path=config.effective_fastagent_config,
+        cards_path=cards_path,
+        artifact_root=batch_folder / "remote_downloads",
+        run_baseline=resolved.run_baseline,
+        operation="eval",
+    )
+    console.print(f"Remote fast-agent job id(s): {', '.join(job_refs)}")
+
+
+async def _run_simple_eval(
+    *,
+    skill: Skill,
+    test_cases: list[TestCase],
+    evaluation_model: str,
+    resolved: ResolvedModels,
+    executor_factory: ExecutorFactory,
+    config: Config,
+    cards_path: Path,
+    batch_id: str,
+    batch_folder: Path,
+    verbose: bool,
+    max_parallel: int,
+    log_runs: bool,
+) -> None:
+    """Run the single-model, single-run eval flow with baseline + summary."""
+    console.print(f"Running {len(test_cases)} test cases...", style="dim")
+    executor = executor_factory(evaluation_model)
+
+    results = await evaluate_skill(
+        skill,
+        test_cases,
+        executor=executor,
+        model=evaluation_model,
+        fastagent_config_path=config.effective_fastagent_config,
+        cards_source_dir=cards_path,
+        artifact_root=batch_folder / "eval",
+        run_baseline=resolved.run_baseline,
+        max_parallel=max_parallel,
+        progress_callback=_print_eval_progress,
+        operation="eval",
+    )
+    _raise_on_execution_errors(results, context=f"Evaluation on {evaluation_model}")
+
+    run_results: list[RunResult] = []
+    if log_runs:
+        run_results = _persist_comparison_run_results(
+            batch_folder=batch_folder,
+            model=evaluation_model,
+            task=skill.description,
+            batch_id=batch_id,
+            first_run_number=1,
+            results=results,
+            assertions_total=len(test_cases),
+            run_baseline=resolved.run_baseline,
+            with_skill_passed=(
+                results.is_beneficial
+                if resolved.run_baseline
+                else results.with_skill_success_rate > 0.5
+            ),
+            skill_name=skill.name,
+        )
+        summary = BatchSummary(
+            batch_id=batch_id,
+            model=evaluation_model,
+            task=skill.description,
+            total_runs=len(run_results),
+            passed_runs=sum(1 for r in run_results if r.passed),
+            results=run_results,
+        )
+        write_batch_summary(batch_folder, summary)
+
+    if verbose and resolved.run_baseline:
+        console.print()
+        for i, (with_r, base_r) in enumerate(
+            zip(results.with_skill_results, results.baseline_results, strict=True),
+            1,
+        ):
+            base_icon = "[green]OK[/green]" if base_r.success else "[red]FAIL[/red]"
+            skill_icon = "[green]OK[/green]" if with_r.success else "[red]FAIL[/red]"
+            input_preview = with_r.test_case.input[:40]
+            console.print(f"  {i}. {input_preview}  {base_icon} base  {skill_icon} skill")
+        console.print()
+
+    _print_simple_eval_results(results, resolved=resolved, batch_folder=batch_folder)
+
+
+def _print_simple_eval_results(
+    results: EvalResults,
+    *,
+    resolved: ResolvedModels,
+    batch_folder: Path,
+) -> None:
+    """Render the simple-eval bar chart + recommendation."""
+    console.print()
+    if resolved.run_baseline:
+        baseline_rate = results.baseline_success_rate
+        with_skill_rate = results.with_skill_success_rate
+        lift = results.skill_lift
+
+        baseline_bar = _render_bar(baseline_rate)
+        with_skill_bar = _render_bar(with_skill_rate)
+
+        lift_str = f"+{lift:.0%}" if lift >= 0 else f"{lift:.0%}"
+        lift_style = "green" if lift > 0 else "red" if lift < 0 else "dim"
+
+        console.print(f"  baseline   {baseline_bar}  {baseline_rate:>5.0%}")
+        console.print(
+            f"  with skill {with_skill_bar}  {with_skill_rate:>5.0%}  "
+            f"[{lift_style}]({lift_str})[/{lift_style}]"
+        )
+
+        if results.baseline_total_tokens > 0:
+            savings = results.token_savings
+            savings_str = f"-{savings:.0%}" if savings >= 0 else f"+{-savings:.0%}"
+            savings_style = "green" if savings > 0 else "red" if savings < 0 else "dim"
+            console.print()
+            token_line = (
+                f"  tokens: {results.baseline_total_tokens} → "
+                f"{results.with_skill_total_tokens}  "
+                f"[{savings_style}]({savings_str})[/{savings_style}]"
+            )
+            console.print(token_line)
+    else:
+        with_skill_rate = results.with_skill_success_rate
+        with_skill_bar = _render_bar(with_skill_rate)
+        console.print(f"  with skill {with_skill_bar}  {with_skill_rate:>5.0%}")
+        console.print(f"  tokens: {results.with_skill_total_tokens}")
+
+    console.print(f"\nArtifacts saved to: {batch_folder}")
+    if resolved.run_baseline:
+        if results.is_beneficial:
+            console.print("\n[green]Recommendation: keep skill[/green]")
+        else:
+            console.print("\n[yellow]Recommendation: skill may not be beneficial[/yellow]")
+
+
+async def _eval_async(
     skill_path: str,
     tests: str | None,
     models: list[str] | None,
@@ -1540,23 +1930,7 @@ async def _eval_async(  # noqa: C901
     num_runs = _resolve_num_runs(config, num_runs, command="eval")
     max_parallel = _resolve_max_parallel(config, max_parallel)
     jobs_secrets = _resolve_jobs_secrets(config, jobs_secrets)
-    jobs_config = _require_jobs_config(
-        executor_name=executor_name,
-        artifact_repo=artifact_repo,
-        wait=wait,
-        jobs_timeout=jobs_timeout,
-        jobs_flavor=jobs_flavor,
-        jobs_secrets=jobs_secrets,
-        jobs_namespace=jobs_namespace,
-        jobs_image=config.jobs_image,
-    )
-    executor = None
-    if executor_name == "local" or wait:
-        executor = _build_executor(
-            executor_name,
-            jobs_config=jobs_config,
-            progress_callback=_print_eval_progress,
-        )
+
     resolved = resolve_models(
         "eval",
         config=config,
@@ -1575,6 +1949,31 @@ async def _eval_async(  # noqa: C901
         field="test_generation_model",
         command="eval",
     )
+    # If every model in this run is cli.*, the jobs executor is irrelevant —
+    # downgrade silently so users with `executor: jobs` configs don't have to
+    # supply --artifact-repo for a CLI-only run.
+    executor_name = _maybe_downgrade_to_local(
+        executor_name,
+        models=[*evaluation_models, test_gen_model],
+    )
+    jobs_config = _require_jobs_config(
+        executor_name=executor_name,
+        artifact_repo=artifact_repo,
+        wait=wait,
+        jobs_timeout=jobs_timeout,
+        jobs_flavor=jobs_flavor,
+        jobs_secrets=jobs_secrets,
+        jobs_namespace=jobs_namespace,
+        jobs_image=config.jobs_image,
+    )
+    executor_factory = _make_executor_factory(
+        config=config,
+        executor_name=executor_name,
+        jobs_config=jobs_config,
+        jobs_progress_callback=_print_eval_progress,
+    )
+    if executor_name == "jobs" and not wait:
+        _reject_cli_models_with_jobs_no_wait(evaluation_models)
     model_references = build_fastagent_model_references(config=config, resolved=resolved)
 
     _print_model_plan("eval", resolved, runs=num_runs)
@@ -1592,80 +1991,49 @@ async def _eval_async(  # noqa: C901
         sys.exit(1)
     skill = skill_record.skill
 
-    test_cases, test_source = await _load_test_cases(
-        config=config,
-        skill_record=skill_record,
-        tests_path=tests,
-        test_gen_model=test_gen_model,
-        model_references=model_references,
-    )
-
-    invalid_expected = _count_invalid_expected_cases(test_cases)
-    console.print(f"[dim]Loaded {len(test_cases)} test case(s) from {test_source}[/dim]")
-    if invalid_expected:
-        console.print(
-            "[yellow]"
-            f"{invalid_expected} legacy expected-string test case(s) missing expected strings"
-            "[/yellow]"
-        )
-
     runs_path = Path(runs_dir) if runs_dir else config.runs_dir
     batch_id, batch_folder = create_batch_folder(runs_path)
     console.print(f"Artifacts saved to: {batch_folder}", style="dim")
     if log_runs:
         console.print(f"Logging to: {batch_folder}", style="dim")
 
-    if executor_name == "jobs" and not wait:
-        if jobs_config is None:
-            raise RuntimeError("Jobs config was not initialized.")
-        cards = resources.files("upskill").joinpath("agent_cards")
-        with resources.as_file(cards) as cards_path:
-            if resolved.is_benchmark_mode:
-                submitted_job_refs: list[str] = []
-
-                for model in evaluation_models:
-                    console.print(f"[bold]{model}[/bold]")
-                    for run_num in range(1, num_runs + 1):
-                        job_refs = await _submit_remote_eval_jobs(
-                            skill=skill,
-                            test_cases=test_cases,
-                            model=model,
-                            jobs_config=jobs_config,
-                            fastagent_config_path=config.effective_fastagent_config,
-                            cards_path=cards_path,
-                            artifact_root=batch_folder
-                            / "remote_downloads"
-                            / model
-                            / f"run_{run_num}",
-                            run_baseline=False,
-                            operation="benchmark",
-                        )
-                        submitted_job_refs.extend(job_refs)
-                        console.print(f"Remote fast-agent job id(s): {', '.join(job_refs)}")
-                console.print(
-                    f"Submitted remote fast-agent job id(s): {', '.join(submitted_job_refs)}"
-                )
-                return
-
-            job_refs = await _submit_remote_eval_jobs(
-                skill=skill,
-                test_cases=test_cases,
-                model=evaluation_models[0],
-                jobs_config=jobs_config,
-                fastagent_config_path=config.effective_fastagent_config,
-                cards_path=cards_path,
-                artifact_root=batch_folder / "remote_downloads",
-                run_baseline=resolved.run_baseline,
-                operation="eval",
-            )
-        console.print(f"Remote fast-agent job id(s): {', '.join(job_refs)}")
-        return
-
-    if executor is None:
-        raise RuntimeError("Local executor was not initialized.")
-
     cards = resources.files("upskill").joinpath("agent_cards")
     with resources.as_file(cards) as cards_path:
+        test_cases, test_source = await _load_test_cases(
+            config=config,
+            skill_record=skill_record,
+            tests_path=tests,
+            test_gen_model=test_gen_model,
+            model_references=model_references,
+            artifact_root=batch_folder,
+            cards_source_dir=cards_path,
+        )
+
+        invalid_expected = _count_invalid_expected_cases(test_cases)
+        console.print(f"[dim]Loaded {len(test_cases)} test case(s) from {test_source}[/dim]")
+        if invalid_expected:
+            console.print(
+                "[yellow]"
+                f"{invalid_expected} legacy expected-string test case(s) missing expected strings"
+                "[/yellow]"
+            )
+
+        if executor_name == "jobs" and not wait:
+            if jobs_config is None:
+                raise RuntimeError("Jobs config was not initialized.")
+            await _submit_eval_jobs_no_wait(
+                skill=skill,
+                test_cases=test_cases,
+                evaluation_models=evaluation_models,
+                resolved=resolved,
+                jobs_config=jobs_config,
+                config=config,
+                cards_path=cards_path,
+                batch_folder=batch_folder,
+                num_runs=num_runs,
+            )
+            return
+
         if resolved.is_benchmark_mode:
             console.print(
                 f"\nEvaluating [bold]{skill.name}[/bold] across {len(evaluation_models)} model(s)"
@@ -1676,7 +2044,7 @@ async def _eval_async(  # noqa: C901
                 evaluation_models=evaluation_models,
                 num_runs=num_runs,
                 test_cases=test_cases,
-                executor=executor,
+                executor_factory=executor_factory,
                 config=config,
                 cards_path=cards_path,
                 batch_id=batch_id,
@@ -1694,113 +2062,23 @@ async def _eval_async(  # noqa: C901
                     task=skill.description,
                     all_run_results=all_run_results,
                 )
+            return
 
-        else:
-            # Simple eval mode: single model, single run
-            model = evaluation_models[0]
-            console.print(f"Running {len(test_cases)} test cases...", style="dim")
-
-            results = await evaluate_skill(
-                skill,
-                test_cases,
-                executor=executor,
-                model=model,
-                fastagent_config_path=config.effective_fastagent_config,
-                cards_source_dir=cards_path,
-                artifact_root=batch_folder / "eval",
-                run_baseline=resolved.run_baseline,
-                max_parallel=max_parallel,
-                progress_callback=_print_eval_progress,
-                operation="eval",
-            )
-            _raise_on_execution_errors(results, context=f"Evaluation on {model}")
-
-            # Log results (both baseline and with-skill)
-            run_results: list[RunResult] = []
-            if log_runs:
-                run_results = _persist_comparison_run_results(
-                    batch_folder=batch_folder,
-                    model=model,
-                    task=skill.description,
-                    batch_id=batch_id,
-                    first_run_number=1,
-                    results=results,
-                    assertions_total=len(test_cases),
-                    run_baseline=resolved.run_baseline,
-                    with_skill_passed=(
-                        results.is_beneficial
-                        if resolved.run_baseline
-                        else results.with_skill_success_rate > 0.5
-                    ),
-                    skill_name=skill.name,
-                )
-
-                # Write batch summary
-                summary = BatchSummary(
-                    batch_id=batch_id,
-                    model=model,
-                    task=skill.description,
-                    total_runs=len(run_results),
-                    passed_runs=sum(1 for r in run_results if r.passed),
-                    results=run_results,
-                )
-                write_batch_summary(batch_folder, summary)
-
-            if verbose and resolved.run_baseline:
-                console.print()
-                for i, (with_r, base_r) in enumerate(
-                    zip(results.with_skill_results, results.baseline_results, strict=True),
-                    1,
-                ):
-                    base_icon = "[green]OK[/green]" if base_r.success else "[red]FAIL[/red]"
-                    skill_icon = "[green]OK[/green]" if with_r.success else "[red]FAIL[/red]"
-                    input_preview = with_r.test_case.input[:40]
-                    console.print(f"  {i}. {input_preview}  {base_icon} base  {skill_icon} skill")
-                console.print()
-
-            # Display results with horizontal bars
-            console.print()
-            if resolved.run_baseline:
-                baseline_rate = results.baseline_success_rate
-                with_skill_rate = results.with_skill_success_rate
-                lift = results.skill_lift
-
-                baseline_bar = _render_bar(baseline_rate)
-                with_skill_bar = _render_bar(with_skill_rate)
-
-                lift_str = f"+{lift:.0%}" if lift >= 0 else f"{lift:.0%}"
-                lift_style = "green" if lift > 0 else "red" if lift < 0 else "dim"
-
-                console.print(f"  baseline   {baseline_bar}  {baseline_rate:>5.0%}")
-                console.print(
-                    f"  with skill {with_skill_bar}  {with_skill_rate:>5.0%}  "
-                    f"[{lift_style}]({lift_str})[/{lift_style}]"
-                )
-
-                # Token comparison
-                if results.baseline_total_tokens > 0:
-                    savings = results.token_savings
-                    savings_str = f"-{savings:.0%}" if savings >= 0 else f"+{-savings:.0%}"
-                    savings_style = "green" if savings > 0 else "red" if savings < 0 else "dim"
-                    console.print()
-                    token_line = (
-                        f"  tokens: {results.baseline_total_tokens} → "
-                        f"{results.with_skill_total_tokens}  "
-                        f"[{savings_style}]({savings_str})[/{savings_style}]"
-                    )
-                    console.print(token_line)
-            else:
-                with_skill_rate = results.with_skill_success_rate
-                with_skill_bar = _render_bar(with_skill_rate)
-                console.print(f"  with skill {with_skill_bar}  {with_skill_rate:>5.0%}")
-                console.print(f"  tokens: {results.with_skill_total_tokens}")
-
-            console.print(f"\nArtifacts saved to: {batch_folder}")
-            if resolved.run_baseline:
-                if results.is_beneficial:
-                    console.print("\n[green]Recommendation: keep skill[/green]")
-                else:
-                    console.print("\n[yellow]Recommendation: skill may not be beneficial[/yellow]")
+        await _run_simple_eval(
+            skill=skill,
+            test_cases=test_cases,
+            evaluation_model=evaluation_models[0],
+            resolved=resolved,
+            executor_factory=executor_factory,
+            config=config,
+            cards_path=cards_path,
+            batch_id=batch_id,
+            batch_folder=batch_folder,
+            verbose=verbose,
+            max_parallel=max_parallel,
+            log_runs=log_runs,
+        )
+        return
 
 
 @main.command("list")
@@ -1886,7 +2164,11 @@ def list_cmd(skills_dir: str | None, verbose: bool):
     "models",
     multiple=True,
     required=True,
-    help="Evaluation model(s) to benchmark (repeatable)",
+    help=(
+        "Evaluation model(s) to benchmark (repeatable). Accepts fast-agent "
+        "aliases (e.g. 'sonnet') and CLI agents (cli.claude-code, cli.copilot, "
+        "cli.kiro)."
+    ),
 )
 @click.option(
     "--runs",
@@ -2019,26 +2301,7 @@ async def _benchmark_async(
     num_runs = _resolve_num_runs(config, num_runs, command="benchmark")
     max_parallel = _resolve_max_parallel(config, max_parallel)
     jobs_secrets = _resolve_jobs_secrets(config, jobs_secrets)
-    jobs_config = _require_jobs_config(
-        executor_name=executor_name,
-        artifact_repo=artifact_repo,
-        wait=wait,
-        jobs_timeout=jobs_timeout,
-        jobs_flavor=jobs_flavor,
-        jobs_secrets=jobs_secrets,
-        jobs_namespace=jobs_namespace,
-        jobs_image=config.jobs_image,
-    )
-    if executor_name == "jobs" and not wait:
-        raise click.ClickException(
-            "`benchmark --executor jobs` currently requires `--wait` to assemble results from "
-            "downloaded fast-agent artifacts."
-        )
-    executor = _build_executor(
-        executor_name,
-        jobs_config=jobs_config,
-        progress_callback=_print_eval_progress,
-    )
+
     resolved = resolve_models(
         "benchmark",
         config=config,
@@ -2056,12 +2319,41 @@ async def _benchmark_async(
         field="test_generation_model",
         command="benchmark",
     )
+    executor_name = _maybe_downgrade_to_local(
+        executor_name,
+        models=[*evaluation_models, test_gen_model],
+    )
+    jobs_config = _require_jobs_config(
+        executor_name=executor_name,
+        artifact_repo=artifact_repo,
+        wait=wait,
+        jobs_timeout=jobs_timeout,
+        jobs_flavor=jobs_flavor,
+        jobs_secrets=jobs_secrets,
+        jobs_namespace=jobs_namespace,
+        jobs_image=config.jobs_image,
+    )
+    if executor_name == "jobs" and not wait:
+        raise click.ClickException(
+            "`benchmark --executor jobs` currently requires `--wait` to assemble results from "
+            "downloaded fast-agent artifacts."
+        )
+    executor_factory = _make_executor_factory(
+        config=config,
+        executor_name=executor_name,
+        jobs_config=jobs_config,
+        jobs_progress_callback=_print_eval_progress,
+    )
     model_references = build_fastagent_model_references(config=config, resolved=resolved)
 
     _print_model_plan("benchmark", resolved, runs=num_runs)
 
     skill_record = SkillRecord.load(Path(skill_path))
     skill = skill_record.skill
+
+    out_path = Path(output_dir) if output_dir else config.runs_dir
+    batch_id, batch_folder = create_batch_folder(out_path)
+    console.print(f"Results will be saved to: {batch_folder}", style="dim")
 
     cards = resources.files("upskill").joinpath("agent_cards")
     with resources.as_file(cards) as cards_path:
@@ -2071,13 +2363,9 @@ async def _benchmark_async(
             tests_path=tests_path,
             test_gen_model=test_gen_model,
             model_references=model_references,
+            artifact_root=batch_folder,
+            cards_source_dir=cards_path,
         )
-
-        # Setup output directory
-        out_path = Path(output_dir) if output_dir else config.runs_dir
-
-        batch_id, batch_folder = create_batch_folder(out_path)
-        console.print(f"Results will be saved to: {batch_folder}", style="dim")
 
         console.print(
             f"\nBenchmarking [bold]{skill.name}[/bold] across {len(evaluation_models)} model(s)"
@@ -2088,7 +2376,7 @@ async def _benchmark_async(
             evaluation_models=evaluation_models,
             num_runs=num_runs,
             test_cases=test_cases,
-            executor=executor,
+            executor_factory=executor_factory,
             config=config,
             cards_path=cards_path,
             batch_id=batch_id,
