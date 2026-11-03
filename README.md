@@ -120,6 +120,13 @@ Model flags by command:
 `upskill eval` enters **benchmark mode** whenever you pass multiple `-m` values or `--runs > 1`.
 In benchmark mode, baseline comparison is always off; `--no-baseline` is redundant.
 
+If a verifier raises an exception (for example, an unreadable output file or a
+command timeout), evaluation records an error for that test case and continues
+with the remaining cases and baseline phase. The per-test `test_result.json`
+preserves the agent output, usage statistics, and exception type and message.
+An ordinary failed assertion still has a structured `validation_result`;
+interruption and cancellation are not converted into test failures.
+
 ## Commands
 
 ### `upskill generate`

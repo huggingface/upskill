@@ -6,6 +6,7 @@ import shutil
 import tarfile
 from dataclasses import replace
 from pathlib import Path
+from typing import Never
 
 import pytest
 from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
@@ -13,7 +14,11 @@ from fast_agent.mcp.prompt_serialization import save_json
 from mcp.types import TextContent
 
 from upskill.artifacts import materialize_workspace
-from upskill.evaluate import evaluate_skill, load_eval_results_from_artifact_root
+from upskill.evaluate import (
+    evaluate_skill,
+    get_failure_descriptions,
+    load_eval_results_from_artifact_root,
+)
 from upskill.executors.contracts import ExecutionHandle, ExecutionRequest, ExecutionResult
 from upskill.executors.local_fast_agent import LocalFastAgentExecutor
 from upskill.executors.remote_fast_agent import RemoteFastAgentExecutor
@@ -28,6 +33,11 @@ from upskill.models import (
     VerifierSpec,
 )
 from upskill.result_parsing import parse_fast_agent_results
+from upskill.validators import register_validator
+
+
+class EvaluationInterrupted(BaseException):
+    """Process control exception that must not become an evaluation result."""
 
 
 def _write_result_history(path: Path, *, assistant_text: str) -> None:
@@ -160,7 +170,9 @@ async def test_local_fast_agent_executor_preserves_artifacts_and_parses_results(
     assert (request.artifact_dir / "request.json").exists()
     assert (request.artifact_dir / "stdout.txt").exists()
     assert (request.artifact_dir / "stderr.txt").exists()
-    assert (request.artifact_dir / "workspace" / "context.txt").read_text(encoding="utf-8") == "hello"
+    assert (request.artifact_dir / "workspace" / "context.txt").read_text(
+        encoding="utf-8"
+    ) == "hello"
     assert (request.artifact_dir / "workspace" / "fastagent.config.yaml").exists()
     assert (request.artifact_dir / "cards" / "evaluator.md").exists()
     assert not (request.artifact_dir / "cards" / "skill_gen.md").exists()
@@ -297,7 +309,9 @@ async def test_remote_fast_agent_executor_preserves_artifacts_and_parses_results
     assert (request.artifact_dir / "stdout.txt").exists()
     assert (request.artifact_dir / "stderr.txt").exists()
     assert (request.artifact_dir / "remote_output" / "results" / "request_1.json").exists()
-    assert (request.artifact_dir / "workspace" / "context.txt").read_text(encoding="utf-8") == "remote hello"
+    assert (request.artifact_dir / "workspace" / "context.txt").read_text(
+        encoding="utf-8"
+    ) == "remote hello"
     assert not (request.artifact_dir / "cards" / "skill_gen.md").exists()
     assert not (request.artifact_dir / "cards" / "test_gen.md").exists()
     assert submitted_labels == {
@@ -353,7 +367,9 @@ async def test_remote_fast_agent_executor_submit_preserves_artifacts(
     assert not (request.artifact_dir / "cards" / "skill_gen.md").exists()
     assert not (request.artifact_dir / "cards" / "test_gen.md").exists()
     assert (request.artifact_dir / "skills" / "write-good-prs" / "SKILL.md").exists()
-    submitted_job = json.loads((request.artifact_dir / "submitted_job.json").read_text(encoding="utf-8"))
+    submitted_job = json.loads(
+        (request.artifact_dir / "submitted_job.json").read_text(encoding="utf-8")
+    )
     assert submitted_job["job_id"] == "evalstate/job-123"
     assert submitted_job["run_id"] == "run-456"
 
@@ -633,3 +649,110 @@ async def test_evaluate_skill_includes_job_id_in_execution_errors(tmp_path: Path
         results.with_skill_results[0].error
         == "fast-agent exited with code 1. (job evalstate/job-123)"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "error_type"),
+    [
+        ("binary", "UnicodeDecodeError"),
+        ("directory", "IsADirectoryError"),
+        ("timeout", "TimeoutExpired"),
+        ("validator", "RuntimeError"),
+        ("interrupted", "EvaluationInterrupted"),
+    ],
+)
+async def test_evaluate_skill_preserves_verifier_errors_and_finishes_batches(
+    tmp_path: Path, failure: str, error_type: str
+) -> None:
+    @register_validator("raises-during-evaluation")
+    def broken_validator(**_: object) -> Never:
+        if failure == "interrupted":
+            raise EvaluationInterrupted("stop evaluation")
+        raise RuntimeError("validator could not inspect artifact")
+
+    spec = VerifierSpec(type="file_contains", path="report.txt", text="answer")
+    if failure == "timeout":
+        # A zero-second deadline deterministically times out the shell without
+        # starting a long-lived child process.
+        spec = VerifierSpec(type="command", cmd="exit 0", config={"timeout_seconds": 0})
+    elif failure in ("validator", "interrupted"):
+        spec = VerifierSpec(type="validator", name="raises-during-evaluation")
+    cases = [
+        TestCase(input="bad artifact", verifiers=[spec]),
+        TestCase(input="good answer", expected=ExpectedSpec(contains=["answer"])),
+        TestCase(input="wrong answer", expected=ExpectedSpec(contains=["missing text"])),
+    ]
+    stats = ConversationStats(total_tokens=17, turns=2, tool_calls=1)
+    requests: list[ExecutionRequest] = []
+
+    class ArtifactExecutor:
+        async def execute(self, request: ExecutionRequest) -> ExecutionHandle:
+            requests.append(request)
+            workspace = request.artifact_dir / "workspace"
+            workspace.mkdir(parents=True)
+            if failure == "directory":
+                (workspace / "report.txt").mkdir()
+            else:
+                (workspace / "report.txt").write_bytes(b"\xff")
+            task = asyncio.create_task(
+                asyncio.sleep(
+                    0,
+                    result=ExecutionResult(
+                        output_text="answer",
+                        raw_results_path=None,
+                        stdout_path=request.artifact_dir / "stdout.txt",
+                        stderr_path=request.artifact_dir / "stderr.txt",
+                        artifact_dir=request.artifact_dir,
+                        workspace_dir=workspace,
+                        stats=stats,
+                    ),
+                )
+            )
+            return ExecutionHandle(request=request, task=task)
+
+        async def collect(self, handle: ExecutionHandle) -> ExecutionResult:
+            return await handle.task
+
+        async def cancel(self, handle: ExecutionHandle) -> None:
+            handle.task.cancel()
+
+    root = tmp_path / "evaluation"
+    evaluation = evaluate_skill(
+        Skill(name="write-report", description="Write reports", body="Write a report."),
+        cases,
+        ArtifactExecutor(),
+        model="test-model",
+        fastagent_config_path=tmp_path / "config.yaml",
+        cards_source_dir=tmp_path,
+        artifact_root=root,
+        max_parallel=2,
+    )
+    if failure == "interrupted":
+        with pytest.raises(EvaluationInterrupted, match="stop evaluation"):
+            await evaluation
+        assert not (root / "with-skill" / "test_1" / "test_result.json").exists()
+        assert not (root / "baseline").exists()
+        return
+    results = await evaluation
+    assert len(requests) == 6
+    for batch in (results.with_skill_results, results.baseline_results):
+        failed, successful, mismatch = batch
+        assert not failed.success
+        assert failed.error is not None and error_type in failed.error
+        assert failed.output == "answer"
+        assert failed.stats == stats
+        assert failed.tokens_used == 17 and failed.turns == 2
+        assert failed.validation_result is None
+        assert successful.success and successful.error is None
+        assert not mismatch.success and mismatch.error is None
+        assert mismatch.validation_result is not None
+        assert mismatch.validation_result.assertions_total == 1
+    assert results.with_skill_success_rate == pytest.approx(1 / 3)
+    assert results.baseline_success_rate == pytest.approx(1 / 3)
+    assert results.with_skill_total_tokens == 51
+    assert error_type in get_failure_descriptions(results)[0]
+    restored = load_eval_results_from_artifact_root(
+        skill_name="write-report", model="test-model", artifact_root=root
+    )
+    assert restored == results
