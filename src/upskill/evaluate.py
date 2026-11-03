@@ -292,18 +292,26 @@ async def _run_test_with_evaluator(
         _write_test_result_summary(normalized_artifact_dir / "test_result.json", result)
         return result
 
-    validation_result = check_expected(
-        execution_result.output_text or "",
-        test_case,
-        execution_result.workspace_dir,
-    )
+    validation_result = None
+    verification_error = None
+    try:
+        validation_result = check_expected(
+            execution_result.output_text or "",
+            test_case,
+            execution_result.workspace_dir,
+        )
+    except Exception as exc:
+        logger.exception("Evaluation verification failed", exc_info=exc)
+        verification_error = f"Verification failed: {type(exc).__name__}: {exc}"
+
     result = TestResult(
         test_case=test_case,
-        success=validation_result.passed,
+        success=validation_result.passed if validation_result is not None else False,
         output=execution_result.output_text,
         tokens_used=execution_result.stats.total_tokens,
         turns=execution_result.stats.turns,
         stats=execution_result.stats,
+        error=verification_error,
         validation_result=validation_result,
     )
     _write_test_result_summary(normalized_artifact_dir / "test_result.json", result)
